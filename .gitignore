@@ -26,6 +26,9 @@ models/
 *.h5
 *.pt
 
+# MLflow
+mlruns/
+
 # Logs
 logs/
 *.log
