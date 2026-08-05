@@ -47,3 +47,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.swp
+
+# Generated artifacts from notebooks
+artifacts/
+outputs/
