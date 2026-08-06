@@ -176,6 +176,25 @@ def dataframe_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return json.loads(frame.to_json(orient="records", date_format="iso"))
 
 
+def normalize_mcp_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten common MCP result shapes into a list of display rows."""
+    if len(result) == 1:
+        value = next(iter(result.values()))
+        if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+            return value
+    return [result]
+
+
+def trace_rows_contain_nested(rows: list[dict[str, Any]]) -> bool:
+    """True when trace rows hold dict/list values a dataframe cannot display."""
+    if not rows:
+        return False
+    return any(
+        isinstance(value, (dict, list))
+        for value in pd.DataFrame(rows).iloc[0].tolist()
+    )
+
+
 def contains_persian(text: str) -> bool:
     return any("\u0600" <= char <= "\u06FF" for char in text)
 
@@ -433,14 +452,15 @@ class PromotionDataAgent:
                             raise RuntimeError(result["error"])
                         sql = json.dumps(arguments, ensure_ascii=False)
                         reason = "MCP analysis tool"
+                        rows = normalize_mcp_rows(result)
                         trace = QueryTrace(
                             tool=tool_name,
                             reason=reason,
                             sql=sql,
                             status="success",
-                            row_count=1,
-                            columns=list(result.keys()),
-                            rows=[result],
+                            row_count=len(rows),
+                            columns=list(rows[0].keys()) if rows else list(result.keys()),
+                            rows=rows,
                         )
                         tool_result: dict[str, Any] = {
                             "status": "success",
@@ -522,10 +542,11 @@ class PromotionDataAgent:
                     {
                         "role": "user",
                         "content": (
-                            "Your previous answer contained Persian text or tool-call markup "
-                            "as plain text. Provide only the final answer, entirely in "
-                            "English, with no tool-call markup and no Persian characters. "
-                            "Keep every number, table and SQL result exactly the same."
+                            "Your previous answer contained tool-call markup as plain text "
+                            "or was incomplete. Do not run more tools or explore further. "
+                            "Provide the final answer NOW, entirely in English, directly "
+                            "summarizing the numbers already returned by the tools. No "
+                            "tool-call markup and no Persian characters."
                         ),
                     },
                 ],

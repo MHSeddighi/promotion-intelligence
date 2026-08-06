@@ -19,6 +19,7 @@ from app.agent.llm_agent import (  # noqa: E402
     ANALYSIS_TOOL_NAMES,
     PromotionDataAgent,
     TABLE_INFO,
+    trace_rows_contain_nested,
 )
 from app.config import (  # noqa: E402
     API_BASE_URL,
@@ -119,7 +120,11 @@ def render_query_traces(traces) -> None:
             if error:
                 st.error(error)
             elif rows:
-                st.dataframe(pd.DataFrame(rows), width="stretch")
+                frame = pd.DataFrame(rows)
+                if trace_rows_contain_nested(rows):
+                    st.json(rows)
+                else:
+                    st.dataframe(frame, width="stretch")
             else:
                 st.info("The query returned no results.")
 

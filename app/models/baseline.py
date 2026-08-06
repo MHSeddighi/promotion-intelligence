@@ -200,11 +200,23 @@ class BaselinePredictor:
         )
 
     def load_sample(self, path: Path | None = None) -> pd.DataFrame:
-        sample_path = path or SAMPLE_INPUT
-        if not sample_path.is_file():
-            raise FileNotFoundError(f"Sample model input was not found: {sample_path}")
-        return pd.read_csv(sample_path)
+        """Build a sample row that always matches the loaded model artifacts.
 
+        Numeric features default to 0.0 and categorical features to the first
+        training level, so the sample stays valid even after retraining.
+        """
+        if path is not None:
+            if not path.is_file():
+                raise FileNotFoundError(f"Sample model input was not found: {path}")
+            return pd.read_csv(path)
+        row: dict[str, Any] = {}
+        for feature in self.features:
+            if feature in self.categorical_features:
+                levels = self.category_levels[feature]
+                row[feature] = levels[0] if levels else 0
+            else:
+                row[feature] = 0.0
+        return pd.DataFrame([row])
     def health(self) -> dict[str, Any]:
         return {
             "stage1_model": type(self.stage1).__name__,
