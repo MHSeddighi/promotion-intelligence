@@ -145,6 +145,13 @@ python3 -m promotion_ai.app.mcp.server
 
 ### Forecasting Model
 
+`notebook/01_baseline_detection.ipynb` trains a **hybrid prediction-unit** baseline:
+
+- **High-frequency products** are forecast at PRODUCT_ID level with the existing two-stage hurdle LightGBM (binary positive-demand + Poisson magnitude).
+- **Sparse/long-tail products** (insufficient individual demand history) are embedded from metadata + training-window demand behavior, clustered with KMeans, and forecast at `CLUSTER_ID × STORE_ID × WEEK_NO` units with the same hurdle recipe.
+- A **reconstruction layer** converts cluster predictions back to PRODUCT_ID baselines using Laplace-smoothed historical contribution shares (training period only).
+- Reusable stage logic lives in `app/models/hybrid_units.py` (segmentation, clustering, cluster panel, allocation, sparse-demand metrics), with unit tests in `tests/test_hybrid_units.py`.
+
 Uses LightGBM regression with:
 - Lag features (1, 7, 14 days)
 - Rolling averages (7, 14 days)

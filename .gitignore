@@ -21,6 +21,9 @@ data/processed/
 
 # Models and experiments
 models/
+!app/models/
+!app/models/**
+app/models/__pycache__/
 *.pkl
 *.joblib
 *.h5
