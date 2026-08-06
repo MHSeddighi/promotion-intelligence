@@ -23,11 +23,11 @@
 #
 # **Feature set (this run):** all **54 engineered features** stay in the panel, and the **top 30 are selected by LightGBM gain importance** from a stage-1 selector trained on the full pool (train weeks only). The old 51-feature model and its comparison are removed.
 #
-# **Training (this run):** test and validation splits are removed — the two-stage model trains on the **train** weeks (1–78) with **no early stopping** (all `N_ESTIMATORS` trees), and metrics are reported on the **train** split. A final per-product plot shows how well the baseline predicts **promoted** weeks for each product.
+# **Training (this run):** time-based split — the two-stage model trains on the **train** weeks (1–79, non-promoted) with **no early stopping** (all `N_ESTIMATORS` trees), and metrics are reported on the **train** split plus a held-out **test** split (weeks 80–101, ~1/5 of the data, non-promoted weeks only). A final per-product plot shows how well the baseline predicts **promoted** weeks for each product.
 #
 # **Sample selection:** products with fewer than 10 weeks of data (in the training window) are filtered out. **Leakage safety:** every feature uses only information available before the predicted week (lags/rollings end at `t-1`, encoders fit on the training window, selection on training weeks only).
 #
-# **Outputs** (`outputs/baseline_engine/`): `panel.parquet`, `model_stage1.pkl`, `model_stage2.pkl`, `model.pkl`, `train_predictions.parquet` (+ `test_predictions.parquet` alias for downstream notebooks), `feature_list.json`, `metrics.json` (train metrics + detection), `smoothing_config.json`, `residual_buckets.parquet`, `figures/shap_importance.png`, `figures/promo_baseline_vs_actual.png`.
+# **Outputs** (`outputs/baseline_engine/`): `panel.parquet`, `model_stage1.pkl`, `model_stage2.pkl`, `model.pkl`, `train_predictions.parquet`, `test_predictions.parquet` (real held-out test weeks 80–101, non-promoted rows), `feature_list.json`, `metrics.json` (train + test metrics + detection), `smoothing_config.json`, `config.json`, `residual_buckets.parquet`, `figures/shap_importance.png`, `figures/promo_baseline_vs_actual.png`, `figures/baseline_vs_actual_product_*.png` (one per selected product).
 
 # %%
 # Imports + minimal config
@@ -55,7 +55,8 @@ OUT = ROOT / "outputs" / "baseline_engine"
 MIN_PRODUCT_WEEKS = 0      # min distinct sales weeks (in the training window) for a product to enter the panel
 MIN_WEEKS = 25               # min sales weeks for a product-store pair to enter the panel (training window only)
 FIRST_WEEK, LAST_WEEK = 1, 102
-TRAIN_END = 78  # train 1-78 only (no validation / test split)
+TRAIN_END = 79   # train 1-79 (non-promoted weeks only)
+TEST_START = 80  # held-out test weeks 80-101 (~1/5 of the 101 weeks)
 N_ESTIMATORS, LR, NUM_LEAVES = 500, 0.01, 31
 SEED = 42
 
@@ -387,7 +388,7 @@ print(f"feature pool: {len(ALL_FEATURES)} | panel shape: {panel.shape}")
 # - **Stage 2 (Poisson):** predicts `E[qty | qty > 0]` — LightGBM Poisson regression trained on positive weeks only.
 # - **Combined:** `pred = P(positive) × E[qty | positive]`.
 #
-# Both stages train only on non-promoted train weeks (1–78). No validation split and no early stopping — every model uses all `N_ESTIMATORS` trees.
+# Both stages train only on non-promoted train weeks (1–79). No early stopping — every model uses all `N_ESTIMATORS` trees.
 
 # %%
 # 4. Two-stage hurdle model
@@ -443,12 +444,12 @@ stage2_time = time.time() - t0
 print(f"stage1 trained in {stage1_time:.0f}s | stage2 in {stage2_time:.0f}s")
 
 # %% [markdown]
-# ## 5. Train evaluation (no test split)
+# ## 5. Train evaluation
 #
-# Metrics are computed on the **train** weeks (1–78, non-promoted). Detection thresholds are unchanged (`pred_final > 0.65` = predict non-zero; `pred < 0.05` = missed demand; `pred >= 1.0` = false positive).
+# Metrics are computed on the **train** weeks (1–79, non-promoted). Detection thresholds are unchanged (`pred_final > 0.65` = predict non-zero; `pred < 0.05` = missed demand; `pred >= 1.0` = false positive).
 
 # %%
-# 5. Train evaluation (no test split) + detection diagnostics
+# 5. Train evaluation + detection diagnostics
 THRESHOLD = 0.65     # predicted demand above this counts as "predicting non-zero"
 MISSED_PRED = 0.05  # actual > 0 but prediction close to zero -> missed demand
 FALSE_PRED = 1.0    # actual = 0 but prediction high -> false positive
@@ -481,7 +482,40 @@ print(f"false positives (actual = 0, pred >= {FALSE_PRED}): {false_pos:,}")
 
 
 # %%
-# 5b. Why does the model get non-zero demand wrong? (missed demand + false positives)
+# 5b. Held-out TEST evaluation — weeks 80-101
+#
+# The same metrics on the held-out **test** weeks (80–101, ~1/5 of the data). Only the time-based split separates
+# train from test: the test weeks are never used for sample selection, feature selection, encoder fitting, or training,
+# so the test metrics show how the baseline generalizes to unseen weeks. Only non-promoted test weeks are evaluated
+# (the baseline is a counterfactual demand predictor, not a promoted-demand predictor).
+
+# %%
+# 5b. Test evaluation (held-out weeks 80-101, non-promoted) + detection diagnostics
+test_mask = split_mask(TEST_START, LAST_WEEK - 1)
+test = panel.loc[test_mask].copy()
+test["pred_final"] = hurdle_predict(stage1, stage2, X.loc[test_mask])
+test["error"] = test["pred_final"] - test["qty"]
+
+test_actual_pos = (test["qty"] > 0).to_numpy()
+test_pred_pos = (test["pred_final"] > THRESHOLD).to_numpy()
+test_proba = stage1.predict_proba(X.loc[test_mask])[:, 1]
+tp, tr, tf, tsup = precision_recall_fscore_support(test_actual_pos, test_pred_pos, labels=[True, False])
+test_missed = int(((test["qty"] > 0) & (test["pred_final"] < MISSED_PRED)).sum())
+test_false_pos = int(((test["qty"] == 0) & (test["pred_final"] >= FALSE_PRED)).sum())
+
+print("TEST metrics (weeks 80-101, non-promoted):",
+      {k: round(v, 4) for k, v in metrics(test["qty"], test["pred_final"]).items()})
+print(f"ROC-AUC (P(demand > 0)): {roc_auc_score(test_actual_pos, test_proba):.4f}")
+print(f"PR-AUC (P(demand > 0)): {average_precision_score(test_actual_pos, test_proba):.4f}")
+print(f"accuracy (pred > {THRESHOLD} = non-zero): {(test_pred_pos == test_actual_pos).mean():.4f}")
+print(f"\n{'class':10s} {'precision':>9s} {'recall':>9s} {'F1':>9s} {'support':>8s}")
+for name, pi, ri, fi, si in zip(["non-zero", "zero"], tp, tr, tf, tsup):
+    print(f"{name:10s} {pi:9.4f} {ri:9.4f} {fi:9.4f} {si:8d}")
+print(f"\nmissed demand (actual > 0, pred < {MISSED_PRED}): {test_missed:,}")
+print(f"false positives (actual = 0, pred >= {FALSE_PRED}): {test_false_pos:,}")
+
+# %%
+# 5c. Why does the model get non-zero demand wrong? (missed demand + false positives, train)
 def reason(r):
     if r["qty"] > 0:  # missed demand
         if r["weeks_since_last_sale"] > 8:
@@ -547,12 +581,12 @@ imp.to_parquet(OUT / "shap_importance.parquet", index=False)
 # %% [markdown]
 # ## 7. Save artifacts
 #
-# Artifacts keep the interface consumed by `notebook/02_causality_analysis.ipynb` (`model.pkl` is the stage-2 alias; predictions now come from the **train** split — saved as `train_predictions.parquet`, with `test_predictions.parquet` kept as an alias for the downstream notebook; `metrics.json` carries `train` + `detection`).
+# Artifacts keep the interface consumed by `notebook/02_causality_analysis.ipynb` (`model.pkl` is the stage-2 alias). `test_predictions.parquet` now holds the **real held-out test predictions** (non-promoted weeks 80–101) instead of a train alias; `metrics.json` carries `train` + `test` metrics and detection diagnostics for both; `config.json` keeps the split constants for notebook 02.
 
 # %%
 # 7. Save artifacts
 train.to_parquet(OUT / "train_predictions.parquet", index=False)
-train.to_parquet(OUT / "test_predictions.parquet", index=False)  # alias so 02_causality keeps working
+test.to_parquet(OUT / "test_predictions.parquet", index=False)  # held-out weeks 80-101, non-promoted rows
 panel[["PRODUCT_ID", "STORE_ID", "WEEK_NO", "qty", "promo_week", *FEATURES]].to_parquet(OUT / "panel.parquet", index=False)
 joblib.dump(stage1, OUT / "model_stage1.pkl")
 joblib.dump(stage2, OUT / "model_stage2.pkl")
@@ -563,14 +597,25 @@ json.dump({"features": FEATURES, "features_encoded": FEATURES,
            "similarity_features": [], "non_features": ["qty", "promo_week"]},
           open(OUT / "feature_list.json", "w"), indent=2)
 json.dump({"train": {k.lower(): v for k, v in metrics(train["qty"], train["pred_final"]).items()},
+           "test": {k.lower(): v for k, v in metrics(test["qty"], test["pred_final"]).items()},
            "detection": {"threshold": THRESHOLD,
                          "auc": float(roc_auc_score(actual_pos, new_proba)),
                          "pr_auc": float(average_precision_score(actual_pos, new_proba)),
                          "accuracy": float((pred_pos == actual_pos).mean()),
                          "non_zero": {"precision": float(p[0]), "recall": float(r[0]), "f1": float(f[0]), "support": int(sup[0])},
                          "zero": {"precision": float(p[1]), "recall": float(r[1]), "f1": float(f[1]), "support": int(sup[1])},
-                         "missed_demand": missed, "false_positives": false_pos}},
+                         "missed_demand": missed, "false_positives": false_pos},
+           "detection_test": {"threshold": THRESHOLD,
+                              "auc": float(roc_auc_score(test_actual_pos, test_proba)),
+                              "pr_auc": float(average_precision_score(test_actual_pos, test_proba)),
+                              "accuracy": float((test_pred_pos == test_actual_pos).mean()),
+                              "non_zero": {"precision": float(tp[0]), "recall": float(tr[0]), "f1": float(tf[0]), "support": int(tsup[0])},
+                              "zero": {"precision": float(tp[1]), "recall": float(tr[1]), "f1": float(tf[1]), "support": int(tsup[1])},
+                              "missed_demand": test_missed, "false_positives": test_false_pos}},
           open(OUT / "metrics.json", "w"), indent=2)
+json.dump({"n_top_products": int(panel["PRODUCT_ID"].nunique()), "min_weeks": MIN_WEEKS,
+           "train_end": TRAIN_END, "val_end": 88, "weeks": [FIRST_WEEK, LAST_WEEK - 1]},
+          open(OUT / "config.json", "w"), indent=2)
 json.dump({"alpha": 1.0, "lambda": 0.0, "window": 3, "method": "none (simple baseline)", "min_val_weeks": 0},
           open(OUT / "smoothing_config.json", "w"), indent=2)
 train["vol_bucket"] = pd.qcut(train["pred_final"].rank(method="first"), 4, labels=False)
@@ -633,3 +678,35 @@ plt.show()
 
 print(f"promoted weeks: {len(promo):,} | products: {len(prod):,} | "
       f"log-log corr = {corr:.2f} | under-predicted products = {under:.0%}")
+
+# %% [markdown]
+# ## 9. Baseline predictions vs actual sales — 5 products
+#
+# Uses the **held-out** predictions saved in `test_predictions.parquet` (weeks 80–101, no retraining). Weekly actual sales and baseline predictions are aggregated across stores per product, then the 5 most-sold products in the test set are plotted as separate time series (week on the x-axis, quantity on the y-axis). One figure per product is saved under `outputs/baseline_engine/figures/`.
+
+# %%
+# 9. Baseline predictions vs actual sales for 5 products (existing predictions, no retraining)
+preds = pd.read_parquet(OUT / "test_predictions.parquet")
+weekly = (preds.groupby(["PRODUCT_ID", "WEEK_NO"], as_index=False)
+          .agg(actual=("qty", "sum"), baseline=("pred_final", "sum")))
+
+# Select the 5 products with the most sales in the test set
+top5 = weekly.groupby("PRODUCT_ID")["actual"].sum().nlargest(5).index.tolist()
+
+for pid in top5:
+    s = weekly[weekly["PRODUCT_ID"] == pid].sort_values("WEEK_NO")
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    ax.plot(s["WEEK_NO"], s["actual"], marker="o", ms=3, lw=1.4,
+            color="#1f77b4", label="Actual sales")
+    ax.plot(s["WEEK_NO"], s["baseline"], marker="x", ms=3, lw=1.2,
+            color="#d62728", label="Baseline model prediction")
+    ax.set_xlabel("Week")
+    ax.set_ylabel("Quantity")
+    ax.set_title(f"Baseline predictions vs actual sales — product {pid}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(OUT / "figures" / f"baseline_vs_actual_product_{pid}.png", dpi=140)
+    plt.show()
+
+print(f"saved baseline-vs-actual plots for products {top5} -> {OUT / 'figures'}")

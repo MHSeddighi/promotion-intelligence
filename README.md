@@ -1,241 +1,131 @@
-# Promotion Intelligence Backend
+# Promotion Intelligence
 
-AI-powered promotion analytics system that analyzes historical marketing campaigns to estimate incremental sales, detect cannibalization, calculate ROI, and recommend future campaign strategies.
+End-to-end promotion analytics: a Streamlit frontend, a FastAPI backend, an MCP
+server and an LLM agent that analyze campaign effects using the implemented
+models — **baseline demand prediction**, **incremental sales** and
+**cannibalization** — with honest uncertainty handling.
 
 ## Architecture
 
 ```
-Client / AI Agent
-         |
-    FastAPI Application Layer
-    /                    \
-REST API              MCP Server
-    \                    /
-      Service Layer
-  ----------------------------
-  Promotion Analytics Services
-  Causal Impact Service
-  Cannibalization Service
-  Recommendation Service
-  Forecasting Service
+Streamlit UI  (app/frontend)
       |
-    ML Models Layer
+      v
+FastAPI      (app/main.py + app/api/routers)
       |
-    MLflow Model Registry
-      |
-    Static Dataset Assets
+      +------> LLM agent  (app/agent)  ---> MCP tools (app/mcp) ---> AnalyticsService
+      |                                                                    |
+      +------> REST analytics endpoints --------------------------------> (app/services/analytics.py)
+                                                                          |
+                                              baseline hurdle model (app/models/baseline.py)
+                                              raw transactions + campaigns (data/raw)
+                                              cannibalization predictions (outputs/cannibalization_detection)
 ```
 
-Both REST API and MCP Server share the same service layer — no logic duplication.
+- **Baseline demand** — the trained two-stage hurdle model in
+  `outputs/baseline_engine` is scored on the saved feature panel
+  (`panel.parquet`); no retraining.
+- **Incremental sales** — `incremental = actual_sales − baseline_sales` on the
+  store basis covered by the model.
+- **Cannibalization** — the saved model outputs in
+  `outputs/cannibalization_detection`; if the model has insufficient evidence,
+  no effect is reported.
+- **Uncertainty** — responses carry `data_sufficient`, `confidence` and
+  `signal` flags; the agent phrases uncertainty instead of inventing numbers.
 
-## Data Flow
-
-1. **Static CSV files** (`data/raw/`) are loaded by `DataLoader`
-2. **Service layer** reads pre-aggregated data, computes causal impact, cannibalization, and ROI
-3. **REST API** exposes results via FastAPI endpoints
-4. **MCP Server** exposes the same services as AI agent tools over stdio
-5. **MLflow** tracks trained forecasting models
-
-## Project Structure
+## Project layout
 
 ```
-promotion_ai/
-├── app/
-│   ├── main.py                    # FastAPI application entry
-│   ├── api/
-│   │   ├── campaigns.py           # GET /campaigns, GET /campaigns/{id}
-│   │   ├── analytics.py           # GET /analytics/campaigns/{id}/impact, cannibalization, forecast
-│   │   └── recommendations.py     # GET /recommendations, POST /scenario
-│   ├── mcp/
-│   │   ├── server.py              # MCP stdio server (tools/list, tools/call)
-│   │   └── tools.py               # MCP tool implementations (wrap services)
-│   ├── services/
-│   │   ├── promotion_service.py   # Campaign listing and basic stats
-│   │   ├── causal_service.py      # Difference-in-differences causal impact estimation
-│   │   ├── cannibalization_service.py  # Product substitution detection
-│   │   ├── forecasting_service.py # LightGBM baseline sales prediction
-│   │   └── recommendation_service.py  # Campaign ranking and scenario optimization
-│   ├── models/
-│   │   ├── forecasting.py         # LightGBM training/prediction helpers
-│   │   └── optimizer.py           # Discount optimization via grid search
-│   ├── mlflow/
-│   │   └── registry.py            # Model save/load with MLflow tracking
-│   ├── data/
-│   │   └── loader.py              # Static CSV loader with validation
-│   └── schemas/
-│       └── campaign.py            # Pydantic models for API contracts
-├── data/
-│   └── raw/                       # Static CSV datasets (not committed)
-├── tests/
-│   ├── test_loader.py             # Data loader unit tests
-│   ├── test_services.py           # Service layer unit tests
-│   └── test_api.py                # API integration tests
-├── requirements.txt
-└── README.md
+app/
+  main.py                  # FastAPI entry point
+  config.py                # settings (env: BASELINE_ARTIFACT_DIR, PROMOTION_DATA_DIR,
+                           #        CANNIBALIZATION_ARTIFACT_DIR, OPENAI_*, API_BASE_URL)
+  api/                     # HTTP layer
+    deps.py                # shared singletons + lifespan state
+    schemas.py             # pydantic models
+    routers/               # system, campaigns, analytics, assistant
+  services/analytics.py    # AnalyticsService (campaigns, baseline, incremental, cannibalization)
+  models/baseline.py       # BaselinePredictor (two-stage hurdle inference)
+  agent/llm_agent.py       # LLM agent (SQL tools + MCP analysis tools)
+  mcp/                     # MCPTools registry + stdio server
+  frontend/streamlit_app.py# Streamlit UI
+tests/                     # API / analytics / MCP / agent tests
+data/raw/                  # CSV datasets
+outputs/baseline_engine/   # baseline model artifacts
+outputs/cannibalization_detection/  # cannibalization model outputs
 ```
 
-## REST API Usage
-
-### Base URL: `http://localhost:8000`
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/` | Service info and available endpoints |
-| GET | `/campaigns` | List all campaigns |
-| GET | `/campaigns/{id}` | Get campaign details |
-| GET | `/analytics/campaigns/{id}/impact` | Causal impact analysis with ROI |
-| GET | `/analytics/campaigns/{id}/cannibalization` | Product cannibalization detection |
-| GET | `/analytics/campaigns/{id}/forecast` | Baseline sales forecast |
-| GET | `/recommendations` | Ranked campaign performance |
-| GET | `/recommendations/best?top_n=5` | Best performing campaigns |
-| GET | `/recommendations/worst?top_n=5` | Worst performing campaigns |
-| GET | `/recommendations/patterns` | Discover effective campaign patterns |
-| POST | `/recommendations/scenario` | Recommend optimal discount scenario |
-
-### Scenario Request Example
-
-```json
-{
-  "product_id": 1004906,
-  "budget": 5000.0,
-  "discount_range": [0.05, 0.30],
-  "duration_days": 14
-}
-```
-
-### Scenario Response
-
-```json
-{
-  "recommended_discount": 0.05,
-  "expected_revenue": 183.78,
-  "expected_profit": 174.11,
-  "expected_roi": 18.0,
-  "expected_incremental_sales": 80.12,
-  "confidence": "medium"
-}
-```
-
-## MCP Usage
-
-The MCP server operates over stdio. It implements the [Model Context Protocol](https://modelcontextprotocol.io) for AI agent integration.
-
-### Available MCP Tools
-
-- **`analyze_campaign`** — Full campaign analysis (impact + ROI + cannibalization)
-- **`calculate_campaign_roi`** — ROI calculation for a campaign
-- **`find_best_campaigns`** — Top N campaigns by ROI
-- **`detect_cannibalization`** — Product substitution effects
-- **`recommend_future_campaign`** — Optimal discount strategy recommendation
-
-### Starting MCP Server
+## Setup
 
 ```bash
-python3 -m promotion_ai.app.mcp.server
+cd promotion-intelligence
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### MCP Communication (JSON over stdio)
+Datasets must exist under `data/raw/` (`transaction_data.csv`, `product.csv`,
+`campaign_desc.csv`, `campaign_table.csv`, `coupon.csv`, `coupon_redempt.csv`,
+`hh_demographic.csv`, `causal_data.csv`) and model artifacts under
+`outputs/` (generated by the notebooks in `notebook/`).
+
+## Run
+
+**Backend API**
+
+```bash
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+```
+
+Swagger: `http://127.0.0.1:8001/docs`
+
+**Frontend**
+
+```bash
+python -m streamlit run app/frontend/streamlit_app.py
+```
+
+Tabs: analyst chat, promotion analysis (scenario 1), cannibalization (scenario 2).
+The UI calls the backend at `API_BASE_URL` (default `http://127.0.0.1:8001`).
+
+**MCP server (stdio)**
+
+```bash
+python -m app.mcp.server
+```
 
 ```json
 {"method": "tools/list", "params": {}}
-{"method": "tools/call", "params": {"name": "analyze_campaign", "arguments": {"campaign_id": 1}}}
+{"method": "tools/call", "params": {"name": "get_campaign_effect", "arguments": {"campaign_id": 15}}}
 ```
 
-## ML Workflow
+MCP tools: `list_campaigns`, `get_campaign`, `get_campaign_effect`,
+`get_product_baseline`, `get_incremental_sales`, `get_cannibalization_effect`,
+`get_top_impacted_products`.
 
-### Forecasting Model
-
-`notebook/01_baseline_detection.ipynb` trains a **hybrid prediction-unit** baseline:
-
-- **High-frequency products** are forecast at PRODUCT_ID level with the existing two-stage hurdle LightGBM (binary positive-demand + Poisson magnitude).
-- **Sparse/long-tail products** (insufficient individual demand history) are embedded from metadata + training-window demand behavior, clustered with KMeans, and forecast at `CLUSTER_ID × STORE_ID × WEEK_NO` units with the same hurdle recipe.
-- A **reconstruction layer** converts cluster predictions back to PRODUCT_ID baselines using Laplace-smoothed historical contribution shares (training period only).
-- Reusable stage logic lives in `app/models/hybrid_units.py` (segmentation, clustering, cluster panel, allocation, sparse-demand metrics), with unit tests in `tests/test_hybrid_units.py`.
-
-Uses LightGBM regression with:
-- Lag features (1, 7, 14 days)
-- Rolling averages (7, 14 days)
-- Calendar features (day_of_week, month, quarter)
-- Discount features
-- Product-level aggregates
-
-### MLflow Integration
-
-```python
-from promotion_ai.app.mlflow.registry import ModelRegistry
-
-registry = ModelRegistry()
-registry.save_model(model, "forecast_model", {"n_samples": 10000})
-model, metadata = registry.load_model("forecast_model")
-```
-
-Models are saved to `models/` directory and tracked in MLflow experiments.
-
-### Causal Impact
-
-Simple difference-in-differences approach:
-- Pre-period (28 days before campaign)
-- During period
-- Post-period (28 days after)
-- Adjusts for pre-trend and seasonality effects
-
-### Cannibalization Detection
-
-Compares product sales during vs. before campaign:
-- Identifies products with decreased sales during promotion
-- Excludes promoted products (top 5 by volume)
-- Calculates cannibalization score as lost sales / total sales
-
-## Running Instructions
-
-### Prerequisites
-
-Python 3.10+
-
-### Setup
+**Tests**
 
 ```bash
-# Clone repository
-cd promotion-intelligence
-
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Ensure static datasets exist at:
-# data/raw/transaction_data.csv
-# data/raw/product.csv
-# data/raw/campaign_desc.csv
-# data/raw/campaign_table.csv
+python -m pytest tests/ -q
 ```
 
-### Run FastAPI Server
+## API overview
 
-```bash
-PYTHONPATH=. python3 -m uvicorn promotion_ai.app.main:app --host 0.0.0.0 --port 8000
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/` | Service info |
+| GET | `/health` | Models / DB / OpenAI readiness |
+| GET | `/campaigns` | List campaigns |
+| GET | `/campaigns/{id}` | Campaign detail + promoted products |
+| POST | `/baseline/predict` | Score the two-stage baseline model |
+| POST | `/analytics/promotion-effect` | Actual, baseline, incremental, uplift, summary |
+| POST | `/analytics/incremental-sales` | Incremental sales only |
+| POST | `/analytics/cannibalization-effect` | Affected products, lost quantity, signal |
+| GET | `/analytics/promoted-products` | Products with cannibalization evidence |
+| POST | `/assistant/ask` | LLM data agent (SQL + MCP tools) |
+| POST | `/analytics/explain` | LLM explanation of a campaign/cannibalization question |
+| GET | `/mcp/tools` | List MCP tools |
 
-### Run MCP Server
-
-```bash
-PYTHONPATH=. python3 -m promotion_ai.app.mcp.server
-```
-
-### Run Tests
-
-```bash
-PYTHONPATH=. python3 -m pytest promotion_ai/tests/ -v
-```
-
-## Key Design Decisions
-
-- **No database** — Everything runs from static CSV files loaded into pandas
-- **No authentication** — Hackathon prototype
-- **No frontend** — API-only and MCP-only
-- **Shared services** — REST API and MCP use the same service layer
-- **Cached aggregations** — Services cache aggregated data to avoid repeated expensive joins
-- **Simple causal model** — Difference-in-differences instead of complex causal inference
-- **Grid search optimization** — Simple discount optimization instead of RL
+LLM endpoints read `OPENAI_API_KEY` from the server environment (never from
+requests). Demo inputs: campaign `15` + product `1005637` (positive effect),
+product `934427` (strong cannibalization), product `1004906` (no
+cannibalization), campaign `24` product `35656` (low data).

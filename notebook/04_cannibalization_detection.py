@@ -13,39 +13,47 @@
 # ---
 
 # %% [markdown]
-# # Cannibalization Detection Model
+# # Cannibalization Detection Model — Causal Treatment-Effect (S-Learner)
 #
-# Uses **product embeddings + baseline demand predictions** to detect whether a promotion on product A reduces demand of product B, and to estimate how much demand was lost.
+# Estimates the **causal impact of promoting product A on the sales quantity of product B** with an S-Learner treatment-effect model. The previous weak-label approach (deriving `cannibalization_amount = max(0, baseline_B − actual_B)`) is **replaced** by a counterfactual comparison:
+#
+# ```
+# Cannibalization(A, B) =
+#     Predicted B sales when A is not promoted
+#     − Predicted B sales when A is promoted
+# ```
 #
 # ```
 # Promoted Product A ──► embedding relationship ──► Candidate affected Product B
-#                            │
-#                            └──► 1. Does cannibalization happen?  (classification)
-#                                2. How much demand was lost?      (regression)
+#                              │
+#                              └──► S-Learner:  E[qty_B | features, source_promo_flag]
+#                                           ├── y_control   (source_promo_flag = 0)
+#                                           └── y_treatment (source_promo_flag = 1)
+#                                     cannibalization = max(0, y_control − y_treatment)
 # ```
 #
 # ## Pipeline
 # 1. **Inputs** — transaction data, promotion/campaign data, product metadata, baseline model predictions (`outputs/baseline_engine/`), and the relationship outputs of `03_product_embeddings.py` (`outputs/product_embeddings/`).
-# 2. **Candidate pairs** — only pairs with embedding similarity, same category/brand, or basket substitution evidence (never all pairs).
-# 3. **Features** — relationship, demand, promotion, and competitive-pressure features per `(PROMOTED_PRODUCT, AFFECTED_PRODUCT, WEEK)`.
-# 4. **Targets** — weak labels from baseline-vs-actual deviations on non-promoted affected weeks:
-#    - `cannibalization_flag`: 1 if the affected product's sales drop significantly below its baseline while another product is promoted.
-#    - `cannibalization_amount`: `max(0, baseline_expected_sales - actual_sales)`.
-# 5. **Models** — LightGBM (+ XGBoost when available) classifier, then a LightGBM regressor for lost sales. Evaluated on weeks 98-101 (baseline test window is 89-101).
-# 6. **Explainability** — SHAP driver analysis + worked example.
+# 2. **Candidate pairs** — **unchanged**: only pairs with embedding similarity, same category/brand, or basket substitution evidence (never all pairs).
+# 3. **Pair-week dataset** — every `(source_product, affected_product, week)` row with the target `affected_product_quantity` (actual units) and source / affected / pair features, including the treatment variable `source_promo_flag`.
+# 4. **S-Learner** — one LightGBM regression model `qty_B = f(all features + source_promo_flag)` that learns the conditional effect of a source promotion on the affected product's quantity.
+# 5. **Treatment-effect estimation** — for every pair-week, predict with `source_promo_flag` forced to 0 (control) and 1 (treatment); `cannibalization_quantity = max(0, y_control − y_treatment)`.
+# 6. **Aggregation** — product × product cannibalization matrix (sum / mean predicted cannibalized units).
+# 7. **Validation** — time-based split only (train weeks 1–97, test weeks 98–101), prediction error on actual affected-product sales, SHAP explanation of which features drive cannibalization.
+#
+# **Fast smoke test:** set `CANNIBALIZATION_SMOKE=1` to run a ~10-second end-to-end validation (40 promoted products, 60 trees, small SHAP sample) that writes to `outputs/cannibalization_smoke/` without touching the full artifacts.
 #
 # ## Leakage strategy
-# - Evaluation happens on **weeks 89-101**, the baseline engine's held-out test window.
+# - The S-Learner is trained on **weeks 1-97** and evaluated on **weeks 98-101** (the baseline engine's held-out window is 89-101).
 # - Relationship signals were learned on **weeks 1-88 only** (see notebook 1).
 # - Static pair features (demand correlation, scale ratio, promotion frequency) use **weeks 1-78 only**.
 # - Rolling demand features use only past weeks (`shift(1)` before rolling).
-# - Residual standard deviations used for labeling are computed on **non-promoted weeks 1-88**.
-# - Raw baseline predictions are per-product calibrated on **non-promoted weeks 79-88** (outside the
-#   baseline training window 1-78) so the counterfactual scale matches each product's demand level.
-# - Rows where the affected product is itself promoted are excluded (the drop is confounded by its own promotion).
+# - Raw baseline predictions are per-product calibrated on **non-promoted weeks 79-88** (outside the baseline training window 1-78).
+# - Rows where the affected product is itself promoted are excluded (its own promotion confounds the A→B effect), and `qty_A` (a post-treatment variable) is deliberately **not** used as a model feature.
+# - No weak labels are constructed from `baseline_sales − actual_sales`; the target is the observed affected-product quantity.
 
 # %%
-# 0. Environment check (no-op when packages are already installed; xgboost is optional)
+# 0. Environment check (no-op when packages are already installed)
 from __future__ import annotations
 
 import subprocess
@@ -62,7 +70,7 @@ def _importable(name: str) -> bool:
 
 missing = [pkg for mod, pkg in {"lightgbm": "lightgbm", "shap": "shap", "sklearn": "scikit-learn",
                                 "matplotlib": "matplotlib", "seaborn": "seaborn",
-                                "pyarrow": "pyarrow", "xgboost": "xgboost"}.items() if not _importable(mod)]
+                                "pyarrow": "pyarrow", "joblib": "joblib"}.items() if not _importable(mod)]
 if missing:
     print("installing missing packages:", missing)
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *set(missing)])
@@ -70,6 +78,7 @@ if missing:
 # %%
 # 1. Imports + config
 import json
+import os
 import time
 from pathlib import Path
 
@@ -79,8 +88,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from sklearn.metrics import (average_precision_score, mean_absolute_error, mean_squared_error,
-                             precision_recall_curve, precision_recall_fscore_support, roc_auc_score, roc_curve)
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 ROOT = Path.cwd().resolve()
 if not (ROOT / "data" / "raw" / "transaction_data.csv").exists():
@@ -88,7 +96,12 @@ if not (ROOT / "data" / "raw" / "transaction_data.csv").exists():
 RAW = ROOT / "data" / "raw"
 BASE = ROOT / "outputs" / "baseline_engine"      # baseline model + features (01_baseline_detection.py)
 EMB = ROOT / "outputs" / "product_embeddings"    # embeddings + relationships (03_product_embeddings.py)
-OUT = ROOT / "outputs" / "cannibalization_detection"
+
+# Smoke-test mode: CANNIBALIZATION_SMOKE=1 runs a reduced version (fewer pairs,
+# weeks-limited model, smaller SHAP sample) that finishes in seconds and writes
+# to outputs/cannibalization_smoke/ so the full artifacts stay untouched.
+SMOKE = os.environ.get("CANNIBALIZATION_SMOKE", "") == "1"
+OUT = ROOT / "outputs" / ("cannibalization_smoke" if SMOKE else "cannibalization")
 FIG = OUT / "figures"
 FIG.mkdir(parents=True, exist_ok=True)
 
@@ -96,24 +109,24 @@ FIG.mkdir(parents=True, exist_ok=True)
 FIRST_TEST_WEEK, LAST_TEST_WEEK = 89, 101   # baseline test window
 TRAIN_END = 78                              # static pair features use weeks <= 78 only
 RESID_END = 88                              # residual std / learning window used by notebook 1
-MODEL_SPLIT_WEEK = 97                       # stage-1/2 models: train weeks 89-97, test weeks 98-101
+MODEL_SPLIT_WEEK = 97                       # S-Learner: train weeks 1-97, test weeks 98-101
 
-# Candidate-pair construction
+# Candidate-pair construction (unchanged from the embedding pipeline)
 TOP_SUBS = 10            # substitutes per product from notebook 1
 MAX_CANDIDATES = 12      # cap on candidates per promoted product
 COSINE_MIN = 0.35        # min embedding cosine for same-subcommodity additions
 EVIDENCE_COSINE = 0.45   # min cosine alone counts as substitution evidence
 
-# Weak-label thresholds
-DROP_REL = 0.10          # drop must be >= 10% of the affected product's calibrated baseline
-DROP_STD = 1.0           # drop must be >= 1.0 residual std (non-promoted weeks 1-88)
-MIN_LOST = 1.0           # minimum absolute lost units
+# Source-embedding features: first EMB_DIMS SVD components (ordered by variance)
+EMB_DIMS = 8 if SMOKE else 64
 
 # Baseline calibration (leakage-free): per-product rescale of raw baseline predictions
 CALIB_LO, CALIB_HI = 79, 88   # holdout window the baseline engine never trained on (weeks 1-78)
 
 SEED = 42
 np.random.seed(SEED)
+if SMOKE:
+    print("SMOKE TEST MODE: reduced data/model for a fast end-to-end validation run")
 
 # %% [markdown]
 # ## 2. Load data
@@ -169,8 +182,6 @@ print(f"campaign coverage: {len(campaign_weekly):,} product-weeks | "
 # ## 3. Baseline demand predictions for every product × week
 #
 # Reuses the baseline engine's saved models and feature list to score the **full panel** (all weeks, including promoted ones). This gives a counterfactual `baseline_qty` for every product × store × week, which is then aggregated to product × week.
-#
-# Same interface as `02_causality_analysis.py`: categorical columns are cast to pandas `category` dtype before predicting.
 
 # %%
 # 3. Score full baseline panel -> product x week baseline demand
@@ -178,35 +189,45 @@ fl = json.loads((BASE / "feature_list.json").read_text())
 FEATURES = fl["features"]
 CATS = fl["cat_cols_encoded"]
 
-panel = pd.read_parquet(BASE / "panel.parquet")
-X = panel[FEATURES].copy()
-for c in CATS:
-    X[c] = X[c].astype("category")
-stage1 = joblib.load(BASE / "model_stage1.pkl")
-stage2 = joblib.load(BASE / "model_stage2.pkl")
+base_weekly_cache = OUT / "base_weekly.parquet"
+full_cache = ROOT / "outputs" / "cannibalization" / "base_weekly.parquet"
+if SMOKE and full_cache.exists():
+    base_weekly = pd.read_parquet(full_cache)
+    print("smoke: reused cached base_weekly from the full run:", base_weekly.shape)
+else:
+    panel = pd.read_parquet(BASE / "panel.parquet")
+    X = panel[FEATURES].copy()
+    for c in CATS:
+        X[c] = X[c].astype("category")
+    stage1 = joblib.load(BASE / "model_stage1.pkl")
+    stage2 = joblib.load(BASE / "model_stage2.pkl")
 
-panel["baseline_qty"] = stage1.predict_proba(X)[:, 1] * stage2.predict(X)
-base_weekly = (panel.groupby(["PRODUCT_ID", "WEEK_NO"], as_index=False)["baseline_qty"].sum())
-print("scored panel:", panel.shape, "| product-weeks:", base_weekly.shape,
-      "| baseline test-week correlation vs saved test_predictions:")
-tp = pd.read_parquet(BASE / "test_predictions.parquet", columns=["PRODUCT_ID", "STORE_ID", "WEEK_NO", "pred_final"])
-tp = tp.groupby(["PRODUCT_ID", "WEEK_NO"], as_index=False)["pred_final"].sum()
-chk = base_weekly.merge(tp, on=["PRODUCT_ID", "WEEK_NO"])
-print("   pearson corr =", round(chk["baseline_qty"].corr(chk["pred_final"]), 4), f"(n={len(chk):,})")
-del panel, X, chk
+    panel["baseline_qty"] = stage1.predict_proba(X)[:, 1] * stage2.predict(X)
+    base_weekly = (panel.groupby(["PRODUCT_ID", "WEEK_NO"], as_index=False)["baseline_qty"].sum())
+    base_weekly.to_parquet(OUT / "base_weekly.parquet", index=False)
+    print("scored panel:", panel.shape, "| product-weeks:", base_weekly.shape,
+          "| baseline test-week correlation vs saved test_predictions:")
+    tp = pd.read_parquet(BASE / "test_predictions.parquet", columns=["PRODUCT_ID", "STORE_ID", "WEEK_NO", "pred_final"])
+    tp = tp.groupby(["PRODUCT_ID", "WEEK_NO"], as_index=False)["pred_final"].sum()
+    chk = base_weekly.merge(tp, on=["PRODUCT_ID", "WEEK_NO"])
+    print("   pearson corr =", round(chk["baseline_qty"].corr(chk["pred_final"]), 4), f"(n={len(chk):,})")
+    del panel, X, chk
 
 # %% [markdown]
 # ## 4. Product × week demand / promotion table
 #
-# Aggregates actual demand, promotion flags, discount depth, display/mailer shares, campaign activity, past-only rolling demand, and per-product residual noise (from non-promoted weeks 1-88). All rows are restricted to the baseline panel products (the products we can forecast).
+# Aggregates actual demand, promotion flags, discount depth, unit price, display/mailer shares, campaign activity, past-only rolling demand, and per-product residual noise (from non-promoted weeks 1-88). All rows are restricted to the baseline panel products (the products we can forecast).
 
 # %%
 # 4. Product-week table for baseline-panel products
 panel_products = pd.Index(base_weekly["PRODUCT_ID"].unique(), name="PRODUCT_ID")
 txw = tx.assign(promo=(tx["RETAIL_DISC"] < 0))
+txw["unit_price"] = txw["SALES_VALUE"] / txw["QUANTITY"].where(txw["QUANTITY"] > 0)
+txw.loc[txw["unit_price"] < 0, "unit_price"] = np.nan
 
 pw = txw[txw["PRODUCT_ID"].isin(panel_products)].groupby(["PRODUCT_ID", "WEEK_NO"], as_index=False).agg(
-    qty=("QUANTITY", "sum"), promo=("promo", "max"), disc_min=("RETAIL_DISC", "min"))
+    qty=("QUANTITY", "sum"), promo=("promo", "max"), disc_min=("RETAIL_DISC", "min"),
+    price=("unit_price", "mean"))
 disc_depth = (txw[txw["promo"]][["PRODUCT_ID", "WEEK_NO", "RETAIL_DISC"]]
               .groupby(["PRODUCT_ID", "WEEK_NO"])["RETAIL_DISC"].mean().rename("disc_depth"))
 pw = pw.merge(disc_depth, on=["PRODUCT_ID", "WEEK_NO"], how="left")
@@ -249,6 +270,12 @@ calib["factor"] = calib["factor"].fillna(calib["fallback"]).replace([np.inf, -np
 pw = pw.merge(calib["factor"].rename("calib_factor"), on="PRODUCT_ID", how="left")
 pw["calib_factor"] = pw["calib_factor"].fillna(1.0)
 pw["baseline_cal"] = pw["baseline_qty"] * pw["calib_factor"]
+
+# missing unit prices -> product median (training window only, leakage-free)
+price_med = pw[pw["WEEK_NO"] <= TRAIN_END].groupby("PRODUCT_ID")["price"].median()
+pw["price"] = pw["price"].fillna(pw["PRODUCT_ID"].map(price_med))
+pw["price"] = pw["price"].fillna(pw[pw["WEEK_NO"] <= TRAIN_END]["price"].median()).clip(lower=0.0)
+
 pw = pw[pw["WEEK_NO"].between(1, LAST_TEST_WEEK)].reset_index(drop=True)
 print("product-week rows:", f"{len(pw):,}", "| products:", pw["PRODUCT_ID"].nunique(),
       "| promoted product-weeks 89-101:", int(pw[(pw["promo"] == 1) & (pw["WEEK_NO"] >= FIRST_TEST_WEEK)].shape[0]))
@@ -256,7 +283,7 @@ print("product-week rows:", f"{len(pw):,}", "| products:", pw["PRODUCT_ID"].nuni
 # %% [markdown]
 # ## 5. Candidate product pairs
 #
-# Not every pair is evaluated. For each baseline-panel product we take:
+# **Unchanged** — the embedding/candidate-pair pipeline from the previous version. For each baseline-panel product we take:
 # - its top `TOP_SUBS` substitutes from notebook 1 (`top_k_substitutes.parquet`), and
 # - same-sub-commodity panel products with embedding cosine >= `COSINE_MIN` (from `product_similarity.parquet`),
 #
@@ -302,13 +329,17 @@ subs = subs[evidence].copy()
 subs = subs.sort_values(["promoted_product", "substitute_score"], ascending=[True, False])
 subs["cand_rank"] = subs.groupby("promoted_product").cumcount() + 1
 subs = subs[subs["cand_rank"] <= MAX_CANDIDATES].reset_index(drop=True)
+if SMOKE:
+    keep = subs["promoted_product"].unique()[:40]
+    subs = subs[subs["promoted_product"].isin(keep)].reset_index(drop=True)
+    print("smoke: restricted to", subs["promoted_product"].nunique(), "promoted products ->", len(subs), "pairs")
 print("candidate pairs:", f"{len(subs):,}", "| promoted products:", subs["promoted_product"].nunique(),
       "| avg candidates/promoted product:", round(subs.groupby("promoted_product").size().mean(), 2))
 
 # %% [markdown]
 # ## 6. Static pair features (leakage-free)
 #
-# Relationship signals come from notebook 1 (learned on weeks 1-88). Demand correlation and sales-scale ratio are computed on **weeks 1-78 only** (the baseline training window), so they never see the evaluation period.
+# **Unchanged.** Relationship signals come from notebook 1 (learned on weeks 1-88). Demand correlation and sales-scale ratio are computed on **weeks 1-78 only** (the baseline training window), so they never see the evaluation period.
 
 # %%
 # 6. Static pair features
@@ -341,34 +372,48 @@ for c in ["basket_jaccard", "basket_cosine", "household_jaccard", "store_jaccard
 print("static pair features:", subs.shape, "| mean cosine:", round(subs["cosine_sim"].mean(), 3))
 
 # %% [markdown]
-# ## 7. Pair × week feature table + weak targets
+# ## 7. Source-product embedding features
 #
-# For each candidate pair and each week in 89-101 where the **promoted** product is promoted:
-# - relationship + demand + promotion + competitive-pressure features,
-# - rows where the affected product is itself promoted are dropped (confounded),
-# - targets:
-#   - `cannibalization_amount = max(0, baseline_B - actual_B)`
-#   - `cannibalization_flag = 1` when the drop exceeds `max(0.15 * baseline_B, 1.5 * resid_std_B)` and at least `MIN_LOST` units.
+# Each candidate pair carries the **source product's embedding** (first `EMB_DIMS` SVD components, ordered by variance from notebook 3) so the model can condition the promotion effect on *which* product is promoted. The embedding pipeline itself is unchanged; we only read its output.
 
 # %%
-# 7a. Promoted-product weeks in the test window
-promo_weeks_A = pw[(pw["promo"] == 1) & (pw["WEEK_NO"] >= FIRST_TEST_WEEK) & (pw["WEEK_NO"] <= LAST_TEST_WEEK)][
-    ["PRODUCT_ID", "WEEK_NO"]].rename(columns={"PRODUCT_ID": "promoted_product"})
-df = subs.merge(promo_weeks_A, on="promoted_product", how="inner")
-print("raw pair-week rows (A promoted):", f"{len(df):,}")
+# 7. Source-product embedding features
+emb_cols = ["PRODUCT_ID"] + [f"dim_{i}" for i in range(EMB_DIMS)]
+emb = pd.read_parquet(EMB / "product_embeddings.parquet", columns=emb_cols)
+emb = emb.rename(columns={f"dim_{i}": f"src_emb_{i}" for i in range(EMB_DIMS)})
+subs = subs.merge(emb, left_on="promoted_product", right_on="PRODUCT_ID", how="left").drop(columns=["PRODUCT_ID"])
+n_emb_missing = int(subs["src_emb_0"].isna().sum())
+for c in [f"src_emb_{i}" for i in range(EMB_DIMS)]:
+    subs[c] = subs[c].fillna(0.0)
+print(f"source embeddings: {EMB_DIMS} dims | pairs with embedding: {len(subs) - n_emb_missing:,}/{len(subs):,}")
 
-# 7b. Weekly features for A and B (suffixes _A / _B)
-pw_cols = ["PRODUCT_ID", "WEEK_NO", "qty", "promo", "disc_depth", "display", "mailer",
-           "has_campaign", "n_campaigns", "campaign_type", "rmean4", "baseline_qty", "baseline_cal", "resid_std"]
+# %% [markdown]
+# ## 8. Pair × week dataset
+#
+# For every candidate pair and **every week** (1-101) one row is created. The target is the **observed affected-product quantity** (`qty_B`) — no weak labels are derived from `baseline − actual`. Features cover the source product (treatment flag, discount, price, baseline, embedding), the affected product (baseline prediction, historical quantity, price, category/brand context), and the pair (embedding/category/brand similarity, price ratio, historical correlation).
+#
+# Rows where the affected product is itself promoted are dropped (its own promotion confounds the A→B effect).
+
+# %%
+# 8. Pair × week feature table (target: affected product quantity)
+weeks_all = pd.DataFrame({"WEEK_NO": range(1, LAST_TEST_WEEK + 1)})
+df = subs.merge(weeks_all, how="cross")
+print("raw pair-week rows (all weeks):", f"{len(df):,}")
+
+pw_cols = ["PRODUCT_ID", "WEEK_NO", "qty", "promo", "disc_depth", "price", "display", "mailer",
+           "has_campaign", "n_campaigns", "campaign_type", "qty_lag1", "rmean4", "baseline_cal", "resid_std"]
 pwA = pw[pw_cols].rename(columns={c: c + "_A" for c in pw_cols if c not in ("PRODUCT_ID", "WEEK_NO")})
 pwB = pw[pw_cols].rename(columns={c: c + "_B" for c in pw_cols if c not in ("PRODUCT_ID", "WEEK_NO")})
 df = df.merge(pwA, left_on=["promoted_product", "WEEK_NO"], right_on=["PRODUCT_ID", "WEEK_NO"], how="left")
 df = df.merge(pwB, left_on=["affected_product", "WEEK_NO"], right_on=["PRODUCT_ID", "WEEK_NO"], how="left")
 df = df.drop(columns=["PRODUCT_ID_x", "PRODUCT_ID_y"])
-df = df[df["promo_B"] == 0].reset_index(drop=True)  # affected product not promoted -> attributable drop
-print("pair-week rows after dropping confounded B-promoted weeks:", f"{len(df):,}")
+df = df[df["promo_B"] == 0].reset_index(drop=True)  # affected product not promoted -> effect not confounded
 
-# 7c. Competitive pressure: how many of B's (and A's) substitutes are promoted this week, and how deep
+df["source_promo_flag"] = df["promo_A"].fillna(0).astype(int)   # treatment variable (0/1)
+df["price_ratio_log"] = np.log((df["price_B"] + 1e-3) / (df["price_A"] + 1e-3)).clip(-6, 6)
+df["baseline_ratio_log"] = np.log((df["baseline_cal_B"] + 1) / (df["baseline_cal_A"] + 1))
+
+# 8b. Competitive pressure: how many of B's (and A's) substitutes are promoted this week, and how deep
 subs_B = subs[["promoted_product", "affected_product"]].rename(
     columns={"promoted_product": "B", "affected_product": "substitute"})
 subs_A = subs[["promoted_product", "affected_product"]].rename(
@@ -391,211 +436,268 @@ df = df.merge(press_A, left_on=["promoted_product", "WEEK_NO"], right_on=["A", "
 for c in ["n_sub_promos_B", "sub_promo_disc_B", "n_sub_promos_A", "sub_promo_disc_A"]:
     df[c] = df[c].fillna(0)
 
-# 7d. Targets + derived features
-df["lost_sales"] = (df["baseline_cal_B"] - df["qty_B"]).clip(lower=0.0)
-df["cannibalization_amount"] = df["lost_sales"]
-df["threshold"] = np.maximum(DROP_REL * df["baseline_cal_B"], DROP_STD * df["resid_std_B"])
-df["cannibalization_flag"] = ((df["lost_sales"] >= df["threshold"]) & (df["lost_sales"] >= MIN_LOST)).astype(int)
-df["baseline_ratio_log"] = np.log((df["baseline_cal_B"] + 1) / (df["baseline_cal_A"] + 1))
-df["sales_ratio_log"] = np.log((df["qty_B"] + 1) / (df["qty_A"] + 1))
 df["split"] = np.where(df["WEEK_NO"] <= MODEL_SPLIT_WEEK, "train", "test")
-print("flag rate:", round(df["cannibalization_flag"].mean(), 4),
-      "| positive train/test:", int(df[df.split == "train"].cannibalization_flag.sum()), "/",
-      int(df[df.split == "test"].cannibalization_flag.sum()))
-print("mean lost_sales (all rows):", round(df["lost_sales"].mean(), 2))
+print("pair-week rows:", f"{len(df):,}", "| products:", df["promoted_product"].nunique(),
+      "| train/test:", int((df["split"] == "train").sum()), "/", int((df["split"] == "test").sum()))
+print("treatment rate (source promoted):", round(df["source_promo_flag"].mean(), 4),
+      "| mean target qty_B:", round(df["qty_B"].mean(), 2))
+df.to_parquet(OUT / "pair_features.parquet", index=False)
 
 # %% [markdown]
-# ## 8. Stage 1 — cannibalization detection (classification)
+# ## 9. S-Learner — conditional-effect regression
 #
-# LightGBM classifier (XGBoost is trained alongside when available). Time-based split: weeks 89-97 train, 98-101 test. Metrics: PR-AUC, ROC-AUC, Precision@K, Recall@K.
+# A single LightGBM regressor learns
+#
+# ```
+# qty_B = f(static pair features, source features, affected features, source embedding, source_promo_flag)
+# ```
+#
+# The treatment variable `source_promo_flag` is included like any other feature, so the model can learn how a source promotion shifts the affected product's quantity conditional on all context. `qty_A` (the source's own contemporaneous sales) is **excluded** because it is a post-treatment variable that would bias the treatment effect.
 
 # %%
-# 8. Stage 1: classification model
-FEATURES2 = ["cosine_sim", "sub_commodity_match", "commodity_match", "department_match", "brand_match",
-             "manufacturer_match", "metadata_similarity", "basket_jaccard", "basket_cosine",
-             "household_jaccard", "store_jaccard", "demand_corr", "sales_scale_log_ratio",
-             "substitute_rank", "promo_freq_A", "promo_freq_B",
-             "baseline_cal_A", "baseline_cal_B", "qty_A", "disc_depth_A", "disc_depth_B",
-             "display_A", "display_B", "mailer_A", "mailer_B", "has_campaign_A", "n_campaigns_A",
-             "campaign_type_A", "rmean4_A", "rmean4_B", "n_sub_promos_A", "sub_promo_disc_A",
-             "n_sub_promos_B", "sub_promo_disc_B", "baseline_ratio_log"]
+# 9. S-Learner: one LightGBM regression of affected quantity on all features + treatment
+STATIC_PAIR_FEATURES = ["cosine_sim", "sub_commodity_match", "commodity_match", "department_match",
+                        "brand_match", "manufacturer_match", "metadata_similarity", "basket_jaccard",
+                        "basket_cosine", "household_jaccard", "store_jaccard", "demand_corr",
+                        "sales_scale_log_ratio", "substitute_rank", "promo_freq_A", "promo_freq_B",
+                        "price_ratio_log", "baseline_ratio_log"]
+SOURCE_FEATURES = ["source_promo_flag", "disc_depth_A", "price_A", "baseline_cal_A",
+                   "rmean4_A", "display_A", "mailer_A", "has_campaign_A", "n_campaigns_A", "campaign_type_A",
+                   "n_sub_promos_A", "sub_promo_disc_A"]
+AFFECTED_FEATURES = ["qty_lag1_B", "rmean4_B", "price_B", "baseline_cal_B", "resid_std_B",
+                     "display_B", "mailer_B", "has_campaign_B", "n_campaigns_B", "campaign_type_B",
+                     "n_sub_promos_B", "sub_promo_disc_B"]
+EMBEDDING_FEATURES = [f"src_emb_{i}" for i in range(EMB_DIMS)]
+MODEL_FEATURES = STATIC_PAIR_FEATURES + SOURCE_FEATURES + AFFECTED_FEATURES + EMBEDDING_FEATURES
 
 train = df[df["split"] == "train"].reset_index(drop=True)
 test = df[df["split"] == "test"].reset_index(drop=True)
-print("train rows:", f"{len(train):,}", "| test rows:", f"{len(test):,}",
-      "| positives:", int(train["cannibalization_flag"].sum()), "/", int(test["cannibalization_flag"].sum()))
+print("train rows:", f"{len(train):,}", "| test rows:", f"{len(test):,}", "| features:", len(MODEL_FEATURES))
 
-lgb_params = dict(n_estimators=300, learning_rate=0.05, num_leaves=15, random_state=SEED, n_jobs=-1, verbose=-1)
-m1 = lgb.LGBMClassifier(**lgb_params)
-m1.fit(train[FEATURES2], train["cannibalization_flag"])
-test["probability_of_cannibalization"] = m1.predict_proba(test[FEATURES2])[:, 1]
+bad = [c for c in MODEL_FEATURES if not pd.api.types.is_numeric_dtype(train[c])]
+assert not bad, f"non-numeric model features: {bad}"
 
-y = test["cannibalization_flag"]
-p = test["probability_of_cannibalization"]
-roc_auc = roc_auc_score(y, p)
-pr_auc = average_precision_score(y, p)
-for k in (100, 500, 2000):
-    topk = p.nlargest(min(k, len(p))).index
-    prec_k = y.loc[topk].mean()
-    rec_k = y.loc[topk].sum() / max(1, y.sum())
-    print(f"Precision@{k:5d}: {prec_k:.4f} | Recall@{k:5d}: {rec_k:.4f}")
-
-thr50 = (p >= 0.5).astype(int)
-prf = precision_recall_fscore_support(y, thr50, average="binary", zero_division=0)
-print(f"ROC-AUC: {roc_auc:.4f} | PR-AUC: {pr_auc:.4f} | @0.5 precision/recall/f1: "
-      f"{prf[0]:.4f}/{prf[1]:.4f}/{prf[2]:.4f}")
-
-# XGBoost comparison (optional dependency)
-try:
-    import xgboost as xgb
-
-    m1x = xgb.XGBClassifier(n_estimators=300, learning_rate=0.05, max_depth=5, random_state=SEED, n_jobs=-1,
-                            eval_metric="logloss", tree_method="hist")
-    m1x.fit(train[FEATURES2], train["cannibalization_flag"])
-    px = m1x.predict_proba(test[FEATURES2])[:, 1]
-    print(f"XGBoost      ROC-AUC: {roc_auc_score(y, px):.4f} | PR-AUC: {average_precision_score(y, px):.4f}")
-except ImportError:
-    print("xgboost not available - LightGBM only")
-
-# ROC / PR curves
-fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-fpr, tpr, _ = roc_curve(y, p)
-axes[0].plot(fpr, tpr, label=f"LGBM (AUC {roc_auc:.3f})")
-axes[0].plot([0, 1], [0, 1], "--", color="grey")
-axes[0].set(title="ROC", xlabel="FPR", ylabel="TPR")
-pr_prec, pr_rec, _ = precision_recall_curve(y, p)
-axes[1].plot(pr_rec, pr_prec, label=f"LGBM (AP {pr_auc:.3f})")
-axes[1].set(title="Precision-Recall", xlabel="Recall", ylabel="Precision")
-for ax in axes:
-    ax.legend(loc="best")
-fig.tight_layout()
-fig.savefig(FIG / "roc_pr_stage1.png", dpi=140)
-plt.show()
+t0 = time.time()
+m = lgb.LGBMRegressor(n_estimators=60 if SMOKE else 500, learning_rate=0.05,
+                      num_leaves=15 if SMOKE else 63, min_child_samples=10,
+                      subsample=0.9, subsample_freq=1, colsample_bytree=1.0,
+                      random_state=SEED, n_jobs=-1, verbose=-1)
+m.fit(train[MODEL_FEATURES], train["qty_B"])
+print(f"S-Learner trained in {time.time() - t0:.1f}s | trees: {m.n_estimators}")
+imp = pd.Series(m.feature_importances_, index=MODEL_FEATURES).sort_values(ascending=False)
+print("top 12 features by split gain:")
+print(imp.head(12).to_string())
+print("source_promo_flag gain rank:", int(imp.index.get_loc("source_promo_flag")) + 1,
+      "| gain:", round(float(imp["source_promo_flag"]), 1))
 
 # %% [markdown]
-# ## 9. Stage 2 — lost sales estimation (regression)
+# ## 10. Validation — time-based split, prediction error on affected-product sales
 #
-# LightGBM regressor trained on the **flagged** rows to predict `cannibalization_amount`. Evaluated on flagged test rows with MAE, RMSE, and correlation.
+# The model is evaluated **only** on weeks 98-101 (never trained on them) and all features are past/static-only, so no future information reaches the test predictions. We report the prediction error of `affected_product_quantity` overall and split by whether the source product was actually promoted.
 
 # %%
-# 9. Stage 2: lost-sales regression on flagged rows
-reg_train = train[train["cannibalization_flag"] == 1]
-reg_test = test[test["cannibalization_flag"] == 1]
-MIN_REG_SAMPLES = 20
-if len(reg_train) >= MIN_REG_SAMPLES:
-    m2 = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05, num_leaves=15,
-                           random_state=SEED, n_jobs=-1, verbose=-1)
-    m2.fit(reg_train[FEATURES2], reg_train["cannibalization_amount"])
-    test["estimated_lost_sales"] = np.where(test["probability_of_cannibalization"] >= 0.5,
-                                            np.clip(m2.predict(test[FEATURES2]), 0, None), 0.0)
-    y_reg = reg_test["cannibalization_amount"]
-    pred_reg = np.clip(m2.predict(reg_test[FEATURES2]), 0, None)
-    mae = mean_absolute_error(y_reg, pred_reg)
-    rmse = np.sqrt(mean_squared_error(y_reg, pred_reg))
-    print(f"stage-2 on {len(reg_test):,} flagged test rows:")
-    print(f"  MAE={mae:.2f} | RMSE={rmse:.2f} | pearson corr={np.corrcoef(y_reg, pred_reg)[0, 1]:.4f} | "
-          f"mean actual loss={y_reg.mean():.2f} | mean predicted={pred_reg.mean():.2f}")
-else:
-    m2 = None
-    test["estimated_lost_sales"] = np.where(test["probability_of_cannibalization"] >= 0.5,
-                                            test["lost_sales"], 0.0)
-    y_reg, pred_reg = np.array([]), np.array([])
-    mae = rmse = float("nan")
-    print(f"stage-2 skipped: only {len(reg_train)} flagged train rows (< {MIN_REG_SAMPLES})")
+# 10. Validation: prediction error on affected product sales
+def qty_metrics(d):
+    y = d["qty_B"]
+    p = d["pred_qty_B"]
+    return dict(mae=float(mean_absolute_error(y, p)),
+                rmse=float(np.sqrt(mean_squared_error(y, p))),
+                corr=float(np.corrcoef(y, p)[0, 1]),
+                mean_actual=float(y.mean()), mean_pred=float(p.mean()))
+
+
+train["pred_qty_B"] = m.predict(train[MODEL_FEATURES])
+test["pred_qty_B"] = m.predict(test[MODEL_FEATURES])
+
+print("train MAE/RMSE/corr:", {k: round(v, 3) for k, v in qty_metrics(train).items()})
+print("test  MAE/RMSE/corr:", {k: round(v, 3) for k, v in qty_metrics(test).items()})
+for g in (0, 1):
+    sub = test[test["source_promo_flag"] == g]
+    print(f"test  source_promo_flag={g}:", {k: round(v, 3) for k, v in qty_metrics(sub).items()}, f"(n={len(sub):,})")
 
 # %% [markdown]
-# ## 10. Explainability (SHAP) + worked example
+# ## 11. Treatment-effect estimation for every pair-week
 #
-# Global SHAP importance shows the top cannibalization drivers. A worked example prints a predicted pair with its similarity, estimated lost sales, and top drivers.
+# For every held-out pair-week we create two copies of the evaluation data:
+# - **Counterfactual control** — `source_promo_flag = 0`
+# - **Treatment** — `source_promo_flag = 1`
+#
+# then
+# ```
+# cannibalization_quantity = max(0, y_control − y_treatment)
+# ```
+#
+# (When a week is actually promoted, `disc_depth_A` keeps the real discount; for control weeks the treatment copy has flag=1 at zero depth, so its estimate is a conservative lower bound of a real promotion.)
 
 # %%
-# 10a. SHAP importance on a test sample
+# 11. Estimate treatment effect for every pair-week (test window)
+eval_ctl = test[MODEL_FEATURES].copy()
+eval_ctl["source_promo_flag"] = 0
+eval_trt = test[MODEL_FEATURES].copy()
+eval_trt["source_promo_flag"] = 1
+
+effects = pd.DataFrame({
+    "source_product": test["promoted_product"].to_numpy(),
+    "target_product": test["affected_product"].to_numpy(),
+    "week": test["WEEK_NO"].to_numpy(),
+    "source_promo_flag": test["source_promo_flag"].to_numpy(),
+    "cosine_sim": test["cosine_sim"].to_numpy(),
+    "demand_corr": test["demand_corr"].to_numpy(),
+    "y_control": m.predict(eval_ctl),
+    "y_treatment": m.predict(eval_trt),
+})
+effects["cannibalization_quantity"] = np.maximum(0.0, effects["y_control"] - effects["y_treatment"])
+effects.to_csv(OUT / "pair_effects.csv", index=False)
+print("pair-week effects:", len(effects), "| positive:", int((effects["cannibalization_quantity"] > 0).sum()),
+      "| mean:", round(effects["cannibalization_quantity"].mean(), 3),
+      "| total:", round(effects["cannibalization_quantity"].sum(), 1))
+
+# %% [markdown]
+# ## 12. Product × product cannibalization matrix
+#
+# Aggregates the pair-week effects into a directed `source_product → target_product` matrix with the **sum** and **mean** predicted cannibalized quantity over the evaluation window.
+
+# %%
+# 12. Aggregate: product-product cannibalization matrix
+matrix = effects.groupby(["source_product", "target_product"], as_index=False).agg(
+    n_weeks=("cannibalization_quantity", "size"),
+    sum_cannibalization=("cannibalization_quantity", "sum"),
+    mean_cannibalization=("cannibalization_quantity", "mean"),
+    mean_cosine_sim=("cosine_sim", "mean"),
+    mean_demand_corr=("demand_corr", "mean"),
+)
+matrix = matrix.sort_values("sum_cannibalization", ascending=False).reset_index(drop=True)
+matrix.to_csv(OUT / "cannibalization_matrix.csv", index=False)
+print("cannibalization matrix:", matrix.shape,
+      "| pairs with positive effect:", int((matrix["sum_cannibalization"] > 0).sum()))
+print(matrix.head(10).round(3).to_string(index=False))
+
+# %% [markdown]
+# ## 13. SHAP explainability
+#
+# Two views:
+# 1. **Global model importance** — mean |SHAP| on a held-out sample (what drives `affected_product_quantity`).
+# 2. **Cannibalization drivers** — SHAP difference between the treatment and control predictions (`shap_treatment − shap_control`). A negative contribution means the feature pushes `y_treatment` below `y_control`, i.e. it **increases cannibalization**.
+
+# %%
+# 13a. SHAP importance (global)
 import shap
 
-shap_sample = test.sample(min(3000, len(test)), random_state=SEED)
-explainer = shap.TreeExplainer(m1)
-sv = np.asarray(explainer.shap_values(shap_sample[FEATURES2]))
-if sv.ndim == 3:
-    sv = sv[1]
-shap_imp = pd.DataFrame({"feature": FEATURES2, "mean_abs_shap": np.abs(sv).mean(axis=0)}).sort_values(
+shap_sample = test.sample(min(200 if SMOKE else 1200, len(test)), random_state=SEED)
+explainer = shap.TreeExplainer(m)
+sv = explainer.shap_values(shap_sample[MODEL_FEATURES])
+shap_imp = pd.DataFrame({"feature": MODEL_FEATURES, "mean_abs_shap": np.abs(sv).mean(axis=0)}).sort_values(
     "mean_abs_shap", ascending=False).reset_index(drop=True)
-print("top 12 cannibalization drivers by mean |SHAP|:")
-print(shap_imp.head(12).round(4).to_string(index=False))
 shap_imp.to_parquet(OUT / "shap_importance.parquet", index=False)
 
-fig, ax = plt.subplots(figsize=(9, 8))
-sns.barplot(data=shap_imp.head(15), x="mean_abs_shap", y="feature", color="#d62728", ax=ax)
-ax.set_title("SHAP importance — cannibalization detection (stage 1)")
+print("top 15 features by mean |SHAP| (affected-quantity model):")
+print(shap_imp.head(15).round(4).to_string(index=False))
+
+fig, ax = plt.subplots(figsize=(10, 8))
+sns.barplot(data=shap_imp.head(20), x="mean_abs_shap", y="feature", color="#1f77b4", ax=ax)
+ax.set_title("SHAP importance — S-Learner (affected quantity model)")
 fig.tight_layout()
-fig.savefig(FIG / "shap_importance.png", dpi=140)
+fig.savefig(OUT / "shap_importance.png", dpi=140)
 plt.show()
 
-# 10b. Worked example: highest predicted loss in the test window
-ex_idx = test["estimated_lost_sales"].nlargest(1).index[0]
-ex_row = test.loc[ex_idx]
-pos = list(shap_sample.index).index(ex_idx) if ex_idx in shap_sample.index else None
+# %%
+# 13b. Cannibalization drivers: SHAP difference (treatment - control)
+Xc = shap_sample[MODEL_FEATURES].copy()
+Xc["source_promo_flag"] = 0
+Xt = shap_sample[MODEL_FEATURES].copy()
+Xt["source_promo_flag"] = 1
+sv_c = explainer.shap_values(Xc)
+sv_t = explainer.shap_values(Xt)
+contrib = (sv_t - sv_c).mean(axis=0)
+drivers = pd.DataFrame({"feature": MODEL_FEATURES, "mean_effect_contribution": contrib}).sort_values(
+    "mean_effect_contribution")
+drivers.to_csv(OUT / "shap_cannibalization_drivers.csv", index=False)
 
+mean_effect = float((sv_t - sv_c).sum(axis=1).mean())
+print("mean E[y_treatment - y_control] =", round(mean_effect, 4),
+      "| sum of feature contributions =", round(float(contrib.sum()), 4))
+print("\ntop features that INCREASE cannibalization (negative contribution):")
+print(drivers.head(10).round(4).to_string(index=False))
+
+vis = pd.concat([drivers.head(15), drivers.tail(15)]).drop_duplicates("feature").sort_values(
+    "mean_effect_contribution")
+fig2, ax2 = plt.subplots(figsize=(10, 9))
+ax2.barh(vis["feature"], vis["mean_effect_contribution"],
+         color=np.where(vis["mean_effect_contribution"] < 0, "#d62728", "#1f77b4"))
+ax2.axvline(0, color="grey", lw=0.8)
+ax2.set(xlabel="mean contribution to E[y_treatment − y_control] (negative ⇒ more cannibalization)",
+        title="SHAP difference (treatment − control): features driving predicted cannibalization")
+fig2.tight_layout()
+fig2.savefig(FIG / "shap_cannibalization_drivers.png", dpi=140)
+plt.show()
+
+# 13c. Worked example: largest predicted cannibalization in the test window
+ex_idx = effects["cannibalization_quantity"].nlargest(1).index[0]
+ex_row = effects.loc[ex_idx]
 print("=" * 100)
 print("WORKED EXAMPLE (test window)")
-for pid_col, label in [("promoted_product", "Promoted product"), ("affected_product", "Affected product")]:
+for pid_col, label in [("source_product", "Promoted product"), ("target_product", "Affected product")]:
     pid = int(ex_row[pid_col])
-    m = product[product["PRODUCT_ID"] == pid]
-    if not m.empty:
-        r = m.iloc[0]
+    pinfo = product[product["PRODUCT_ID"] == pid]
+    if not pinfo.empty:
+        r = pinfo.iloc[0]
         print(f"{label}: {pid} | {r['BRAND']} | {r['COMMODITY_DESC']} | {r['SUB_COMMODITY_DESC']}")
     else:
         print(f"{label}: {pid}")
-print(f"Week: {int(ex_row['WEEK_NO'])}")
-print(f"Embedding similarity: {ex_row['cosine_sim']:.2f} | "
-      f"probability_of_cannibalization: {ex_row['probability_of_cannibalization']:.3f} | "
-      f"estimated_lost_sales: {ex_row['estimated_lost_sales']:.1f} units")
-print(f"Actual lost vs baseline: {ex_row['lost_sales']:.1f} units (calibrated baseline {ex_row['baseline_cal_B']:.1f}, "
-      f"actual {ex_row['qty_B']:.1f})")
-if pos is not None:
-    row_shap = pd.Series(sv[pos], index=FEATURES2)
-    drivers = row_shap.abs().sort_values(ascending=False).head(5).index
-    print("Main drivers (SHAP value):")
-    for f in drivers:
-        print(f"  {f:28s} shap={row_shap[f]:+.4f}  (value={ex_row[f]:.4f})")
+print(f"Week: {int(ex_row['week'])} | embedding cosine: {ex_row['cosine_sim']:.3f}")
+print(f"y_control (A not promoted): {ex_row['y_control']:.2f} | "
+      f"y_treatment (A promoted): {ex_row['y_treatment']:.2f} | "
+      f"cannibalization_quantity: {ex_row['cannibalization_quantity']:.2f}")
+if ex_idx in shap_sample.index:
+    pos = list(shap_sample.index).index(ex_idx)
+    delta_row = sv_t[pos] - sv_c[pos]
+    row_drivers = pd.Series(delta_row, index=MODEL_FEATURES).sort_values()
+    print("Main drivers of this effect (SHAP difference, negative => more cannibalization):")
+    test_row = test.loc[ex_idx]
+    for f in row_drivers.head(5).index:
+        print(f"  {f:28s} contrib={row_drivers[f]:+.4f}  (value={test_row[f]:.4f})")
 else:
     print("(example row not in SHAP sample; driver detail skipped)")
 
 # %% [markdown]
-# ## 11. Save outputs
+# ## 14. Save outputs
 #
-# `cannibalization_predictions.parquet` carries the requested columns: `promoted_product`, `affected_product`, `week`, `probability_of_cannibalization`, `estimated_lost_sales` (plus reference columns).
+# Saved under `outputs/cannibalization/`:
+# - `causal_model.pkl` — the S-Learner LightGBM regressor
+# - `cannibalization_matrix.csv` — product × product sum/mean predicted cannibalization
+# - `pair_effects.csv` — per pair-week `y_control`, `y_treatment`, `cannibalization_quantity`
+# - `shap_importance.png` — global SHAP importance
+# - plus `metrics.json`, the pair-feature table, candidate pairs, and SHAP details
 
 # %%
-# 11. Save artifacts
-pred_out = test.rename(columns={"WEEK_NO": "week"})[["promoted_product", "affected_product", "week",
-                                                     "probability_of_cannibalization", "estimated_lost_sales",
-                                                     "cannibalization_flag", "lost_sales", "cosine_sim"]]
-pred_out = pred_out.sort_values("probability_of_cannibalization", ascending=False).reset_index(drop=True)
-pred_out.to_parquet(OUT / "cannibalization_predictions.parquet", index=False)
-
-df.to_parquet(OUT / "pair_features.parquet", index=False)
+# 14. Save artifacts
+joblib.dump(m, OUT / "causal_model.pkl")
 subs.to_parquet(OUT / "candidate_pairs.parquet", index=False)
-joblib.dump(m1, OUT / "stage1_classifier.pkl")
-if m2 is not None:
-    joblib.dump(m2, OUT / "stage2_regressor.pkl")
 
-json.dump({"features": FEATURES2, "n_candidates": int(len(subs)), "n_pair_weeks": int(len(df)),
-           "positive_rate": float(df["cannibalization_flag"].mean()),
-           "stage1": {"roc_auc": float(roc_auc), "pr_auc": float(pr_auc),
-                      "precision@0.5": float(prf[0]), "recall@0.5": float(prf[1]), "f1@0.5": float(prf[2])},
-           "stage2": {"mae": float(mae), "rmse": float(rmse),
-                      "pearson_corr": float(np.corrcoef(y_reg, pred_reg)[0, 1]) if len(y_reg) else None,
-                      "n_flagged_test": int(len(reg_test))},
-           "config": {"first_test_week": FIRST_TEST_WEEK, "last_test_week": LAST_TEST_WEEK,
-                      "train_end": TRAIN_END, "resid_end": RESID_END, "model_split_week": MODEL_SPLIT_WEEK,
-                      "top_subs": TOP_SUBS, "max_candidates": MAX_CANDIDATES,
-                      "cosine_min": COSINE_MIN, "evidence_cosine": EVIDENCE_COSINE,
-                      "drop_rel": DROP_REL, "drop_std": DROP_STD, "min_lost": MIN_LOST, "seed": SEED}},
-          open(OUT / "metrics.json", "w"), indent=2)
+json.dump({
+    "model": "S-Learner LightGBM regression (causal treatment-effect)",
+    "n_features": len(MODEL_FEATURES),
+    "features": MODEL_FEATURES,
+    "n_candidates": int(len(subs)),
+    "n_pair_weeks": {"train": int(len(train)), "test": int(len(test))},
+    "validation": {"train": qty_metrics(train), "test": qty_metrics(test),
+                   "test_promo_off": qty_metrics(test[test["source_promo_flag"] == 0]),
+                   "test_promo_on": qty_metrics(test[test["source_promo_flag"] == 1])},
+    "effects": {"n_pair_weeks": int(len(effects)),
+                "n_positive": int((effects["cannibalization_quantity"] > 0).sum()),
+                "mean_cannibalization": float(effects["cannibalization_quantity"].mean()),
+                "total_cannibalization": float(effects["cannibalization_quantity"].sum())},
+    "config": {"first_test_week": FIRST_TEST_WEEK, "last_test_week": LAST_TEST_WEEK,
+               "train_end": TRAIN_END, "resid_end": RESID_END, "model_split_week": MODEL_SPLIT_WEEK,
+               "top_subs": TOP_SUBS, "max_candidates": MAX_CANDIDATES,
+               "cosine_min": COSINE_MIN, "evidence_cosine": EVIDENCE_COSINE,
+               "emb_dims": EMB_DIMS, "seed": SEED}},
+    open(OUT / "metrics.json", "w"), indent=2)
 
 print("saved ->", OUT)
 for f in sorted(OUT.iterdir()):
     if f.is_file():
         print(f"  {f.name:38s} {f.stat().st_size / 1e6:8.2f} MB")
-print("\ntop predicted cannibalization events (test window):")
-print(pred_out.head(10).round(3).to_string(index=False))
+
+print("\ntop product-product cannibalization pairs (test window):")
+print(matrix.head(10).round(3).to_string(index=False))

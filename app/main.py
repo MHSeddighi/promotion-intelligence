@@ -1,34 +1,33 @@
+"""FastAPI application entry point."""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
-from app.api.campaigns import router as campaigns_router
-from app.api.analytics import router as analytics_router
-from app.api.recommendations import router as recommendations_router
+
+from app.api.deps import init_state, shutdown_state
+from app.api.routers import analytics, assistant, campaigns, system
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_state()
+    yield
+    shutdown_state()
+
 
 app = FastAPI(
-    title="Promotion Intelligence API",
-    description="AI-powered promotion analytics and campaign recommendation system",
-    version="0.1.0",
+    title="Unified Promotion Intelligence API",
+    description=(
+        "Baseline hurdle-model inference plus an LLM-powered analytics agent "
+        "backed by MCP tools (promotion effect, incremental sales, cannibalization)."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
-app.include_router(campaigns_router)
-app.include_router(analytics_router)
-app.include_router(recommendations_router)
-
-
-@app.get("/")
-def root():
-    return {
-        "service": "Promotion Intelligence Backend",
-        "version": "0.1.0",
-        "endpoints": {
-            "campaigns": "/campaigns",
-            "campaign_detail": "/campaigns/{id}",
-            "campaign_impact": "/analytics/campaigns/{id}/impact",
-            "campaign_cannibalization": "/analytics/campaigns/{id}/cannibalization",
-            "campaign_forecast": "/analytics/campaigns/{id}/forecast",
-            "recommendations": "/recommendations",
-            "best_campaigns": "/recommendations/best",
-            "worst_campaigns": "/recommendations/worst",
-            "patterns": "/recommendations/patterns",
-            "scenario": "/recommendations/scenario",
-        },
-    }
+app.include_router(system.router)
+app.include_router(campaigns.router)
+app.include_router(analytics.router)
+app.include_router(assistant.router)
