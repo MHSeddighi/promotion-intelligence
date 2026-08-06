@@ -147,10 +147,14 @@ try:
 except FileNotFoundError:
     print("causal_weekly.parquet missing -> aggregating from raw causal_data.csv (may take a minute)")
     causal_raw = pd.read_csv(RAW / "causal_data.csv", usecols=["PRODUCT_ID", "STORE_ID", "WEEK_NO", "display", "mailer"])
+    # display/mailer are categorical position codes (e.g. '0'-'9', 'A'), not numbers;
+    # "0" means no display/mailer, any other code means on -> compare as strings.
+    causal_raw["display_on"] = causal_raw["display"].astype(str).ne("0").astype(int)
     causal_raw["mailer_on"] = causal_raw["mailer"].astype(str).ne("0").astype(int)
     causal = (causal_raw.groupby(["PRODUCT_ID", "WEEK_NO"], as_index=False)
-              .agg(display_share=("display", lambda s: (s > 0).mean()),
+              .agg(display_share=("display_on", "mean"),
                    mailer_share=("mailer_on", "mean")))
+    (ROOT / "data" / "processed").mkdir(parents=True, exist_ok=True)
     causal.to_parquet(ROOT / "data" / "processed" / "causal_weekly.parquet", index=False)
 causal = causal.rename(columns={"display_share": "display", "mailer_share": "mailer"})
 

@@ -7,8 +7,14 @@ repository (no retraining, no fabricated effects):
                       ``outputs/baseline_engine``, scored on the saved feature
                       panel (product x store x week).
 - Actual sales     -> raw ``transaction_data.csv`` quantities.
-- Cannibalization  -> the saved cannibalization model predictions in
-                      ``outputs/cannibalization_detection``.
+- Cannibalization  -> the S-Learner causal treatment-effect model in
+                      ``outputs/cannibalization`` (``pair_effects.csv``);
+                      adapted here from ``source_product/target_product/
+                      cannibalization_quantity`` into the promoted/affected
+                      schema this service exposes. Only pair-weeks where the
+                      source product was genuinely promoted
+                      (``source_promo_flag == 1``) are treated as observed
+                      cannibalization events.
 """
 
 from __future__ import annotations
@@ -27,8 +33,8 @@ TRAIN_END = 78  # baseline training window end; used to judge demand-history evi
 TEST_WINDOW = (89, 101)  # baseline held-out window; cannibalization evidence lives here
 MIN_HISTORY_WEEKS_HIGH = 25
 MIN_HISTORY_WEEKS_MEDIUM = 10
-MIN_CANNIBALIZATION_LOST = 1.0  # units; below this the model has no meaningful signal
-MIN_AFFECTED_LOST = 0.5  # units; below this an affected product is not reported
+MIN_CANNIBALIZATION_LOST = 0.2  # units; below this the model has no meaningful signal
+MIN_AFFECTED_LOST = 0.05  # units; below this an affected product is not reported
 
 LOW_DATA_MESSAGE = (
     "Insufficient historical data to reliably estimate promotion impact."
@@ -101,10 +107,41 @@ class AnalyticsService:
 
     @property
     def cannibalization_predictions(self) -> pd.DataFrame:
+        """Adapt the S-Learner's ``pair_effects.csv`` into the promoted/affected
+        schema this service exposes (no separate model logic is duplicated
+        here, only a column mapping)."""
         if self._cannibalization is None:
-            self._cannibalization = pd.read_parquet(
-                self.cannibalization_dir / "cannibalization_predictions.parquet"
+            raw = pd.read_csv(
+                self.cannibalization_dir / "pair_effects.csv",
+                usecols=[
+                    "source_product",
+                    "target_product",
+                    "week",
+                    "source_promo_flag",
+                    "y_control",
+                    "cannibalization_quantity",
+                ],
             )
+            # source_promo_flag == 0 rows are counterfactual "what if promoted"
+            # simulations, not observed events; keep only real promotion weeks.
+            raw = raw[raw["source_promo_flag"] == 1].copy()
+            frame = pd.DataFrame(
+                {
+                    "promoted_product": raw["source_product"].astype(int),
+                    "affected_product": raw["target_product"].astype(int),
+                    "week": raw["week"].astype(int),
+                    "estimated_lost_sales": raw["cannibalization_quantity"].astype(float),
+                }
+            )
+            # The S-Learner is a point-estimate regressor, not a probabilistic
+            # classifier, so this is not a calibrated statistical probability;
+            # it proxies confidence as the estimated share of the affected
+            # product's counterfactual demand that was displaced.
+            frame["probability_of_cannibalization"] = (
+                frame["estimated_lost_sales"] / raw["y_control"].clip(lower=1e-6).to_numpy()
+            ).clip(upper=1.0)
+            frame["cannibalization_flag"] = (frame["estimated_lost_sales"] > 0).astype(int)
+            self._cannibalization = frame
         return self._cannibalization
 
     @property

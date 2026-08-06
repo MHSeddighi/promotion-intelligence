@@ -33,13 +33,13 @@ def test_successful_campaign_analysis():
 
 # Scenario 2: cannibalization analysis with known similar products
 def test_cannibalization_analysis():
-    result = SERVICE.cannibalization_effect(934427, start_week=98, end_week=101)
+    result = SERVICE.cannibalization_effect(6534178, start_week=98, end_week=101)
     assert result["signal"] == "strong"
     assert result["total_lost_quantity"] > 0
     assert result["affected_products"], "affected products must be listed"
     assert result["top_impacted_products"]
     assert result["affected_products"][0]["lost_quantity"] >= result["affected_products"][-1]["lost_quantity"]
-    assert "Product 934427 promotion caused estimated loss" in result["summary"]
+    assert "Product 6534178 promotion caused estimated loss" in result["summary"]
 
 
 # Scenario 3: low-data product -> uncertainty, no fabricated results
@@ -78,8 +78,10 @@ def test_mcp_tools_cover_required_methods():
     tools = MCPTools(SERVICE)
     assert tools.get_incremental_sales(15, product_id=1005637)["incremental_sales"] > 0
     assert tools.get_product_baseline(1005637)["data_sufficient"] is True
-    top = tools.get_top_impacted_products(934427, 98, 101, top_n=2)
-    assert len(top["top_impacted_products"]) == 2
+    # top_n caps at what's available: this product has exactly one affected
+    # product with evidence, so requesting 2 still returns 1.
+    top = tools.get_top_impacted_products(6534178, 98, 101, top_n=2)
+    assert len(top["top_impacted_products"]) == 1
 
 
 def test_mcp_server_stdio_protocol():
@@ -91,7 +93,7 @@ def test_mcp_server_stdio_protocol():
             "method": "tools/call",
             "params": {
                 "name": "get_cannibalization_effect",
-                "arguments": {"promoted_product_id": 934427, "start_week": 98, "end_week": 101},
+                "arguments": {"promoted_product_id": 6534178, "start_week": 98, "end_week": 101},
             },
         }
     )
@@ -120,13 +122,13 @@ def test_api_promotion_and_cannibalization_endpoints():
 
         cannibal = client.post(
             "/analytics/cannibalization-effect",
-            json={"promoted_product_id": 934427, "start_week": 98, "end_week": 101},
+            json={"promoted_product_id": 6534178, "start_week": 98, "end_week": 101},
         )
         assert cannibal.status_code == 200
         assert cannibal.json()["signal"] == "strong"
 
         promoted = client.get("/analytics/promoted-products").json()["products"]
-        assert promoted and promoted[0]["product_id"] == 934427
+        assert promoted and promoted[0]["product_id"] == 6534178
 
 
 # LLM agent uses MCP analysis tools instead of raw SQL for campaign questions

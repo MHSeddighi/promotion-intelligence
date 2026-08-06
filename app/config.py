@@ -23,7 +23,7 @@ ARTIFACT_DIR = _environment_path(
 DATA_DIR = _environment_path("PROMOTION_DATA_DIR", PROJECT_ROOT / "data" / "raw")
 CANNIBALIZATION_DIR = _environment_path(
     "CANNIBALIZATION_ARTIFACT_DIR",
-    PROJECT_ROOT / "outputs" / "cannibalization_detection",
+    PROJECT_ROOT / "outputs" / "cannibalization",
 )
 
 DEFAULT_OPENAI_BASE_URL = "https://api.deepseek.com"
