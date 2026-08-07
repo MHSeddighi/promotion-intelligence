@@ -95,7 +95,16 @@ class AnalyticsService:
         if self._transactions is None:
             self._transactions = pd.read_csv(
                 self.data_dir / "transaction_data.csv",
-                usecols=["PRODUCT_ID", "STORE_ID", "WEEK_NO", "QUANTITY", "SALES_VALUE", "RETAIL_DISC"],
+                usecols=[
+                    "PRODUCT_ID",
+                    "STORE_ID",
+                    "WEEK_NO",
+                    "QUANTITY",
+                    "SALES_VALUE",
+                    "RETAIL_DISC",
+                    "COUPON_MATCH_DISC",
+                    "household_key",
+                ],
             )
         return self._transactions
 

@@ -7,12 +7,24 @@ from typing import Any
 
 from app.agent.llm_agent import PromotionDataAgent
 from app.models.baseline import BaselinePredictor
+from app.models.similarity import ProductSimilarityService
 from app.mcp.tools import MCPTools
 from app.services.analytics import AnalyticsService
+from app.services.attribution import IncrementalSalesAttributionService
+from app.services.causal import CausalInferenceService
+from app.services.engine import PromotionAnalysisEngine
+from app.services.ranking import CampaignRankingService
+from app.services.recommendation import RecommendationService
 
 BASELINE = BaselinePredictor()
 ANALYTICS = AnalyticsService()
-MCP = MCPTools(ANALYTICS)
+CAUSAL = CausalInferenceService(ANALYTICS)
+RANKING = CampaignRankingService(ANALYTICS, CAUSAL)
+RECOMMENDATION = RecommendationService(ANALYTICS, CAUSAL, RANKING)
+ENGINE = PromotionAnalysisEngine(ANALYTICS, CAUSAL, RECOMMENDATION)
+SIMILARITY = ProductSimilarityService()
+ATTRIBUTION = IncrementalSalesAttributionService()
+MCP = MCPTools(ANALYTICS, attribution=ATTRIBUTION)
 DATA_AGENT: PromotionDataAgent | None = None
 APP_STATE: dict[str, Any] = {
     "ready": False,

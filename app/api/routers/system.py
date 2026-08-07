@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 from app.api import deps
 from app.api.deps import BASELINE
 from app.api.schemas import BaselineRequest, BaselineResponse, PredictionRow
+from app.mcp.server import handle_request
 from app.mcp.tools import TOOL_DEFINITIONS
 
 router = APIRouter()
@@ -108,3 +109,16 @@ def mcp_tools() -> dict[str, Any]:
             for name, info in TOOL_DEFINITIONS.items()
         ]
     }
+
+
+@router.post("/mcp")
+def mcp_handle(payload: dict[str, Any]) -> dict[str, Any]:
+    """MCP JSON-RPC over HTTP: supports tools/list and tools/call.
+
+    Lets MCP clients talk to the always-fresh API process instead of a stale
+    stdio server. Same request format as ``python -m app.mcp.server``.
+    """
+    try:
+        return handle_request(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

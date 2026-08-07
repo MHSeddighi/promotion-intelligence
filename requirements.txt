@@ -22,6 +22,9 @@ python-dotenv>=1.0
 
 # --- Dev dependencies (for notebooks) ---
 lightgbm>=4.0
+xgboost>=2.0
+catboost>=1.2
+shap>=0.45
 scikit-learn>=1.2
 scipy>=1.9
 faiss-cpu>=1.7

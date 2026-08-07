@@ -252,7 +252,9 @@ def llm_tab() -> None:
 
 
 def _api_get(path: str) -> dict:
-    with httpx.Client(base_url=API_BASE_URL, timeout=120) as client:
+    # trust_env=False: ignore HTTP(S)/ALL_PROXY environment variables so a
+    # system proxy (e.g. socks://127.0.0.1:12334) never breaks API calls.
+    with httpx.Client(base_url=API_BASE_URL, timeout=120, trust_env=False) as client:
         response = client.get(path)
     if response.status_code >= 400:
         detail = response.json().get("detail", response.text) if response.headers.get("content-type", "").startswith("application/json") else response.text
@@ -261,7 +263,7 @@ def _api_get(path: str) -> dict:
 
 
 def _api_post(path: str, payload: dict) -> dict:
-    with httpx.Client(base_url=API_BASE_URL, timeout=120) as client:
+    with httpx.Client(base_url=API_BASE_URL, timeout=120, trust_env=False) as client:
         response = client.post(path, json=payload)
     if response.status_code >= 400:
         detail = response.json().get("detail", response.text) if response.headers.get("content-type", "").startswith("application/json") else response.text
@@ -483,13 +485,228 @@ def cannibalization_tab() -> None:
             st.info(f"LLM explanation is not available (OPENAI_API_KEY must be set on the server): {exc}")
 
 
+def campaign_compare_tab() -> None:
+    """Campaign ranking and comparison UI (Phase 4)."""
+    st.subheader("Campaign Comparison & Ranking")
+    st.caption(
+        "Rank historical campaigns on normalized objectives (profit, sales or "
+        "efficiency) with configurable weights and normalization."
+    )
+    try:
+        campaigns = _api_get("/campaigns")["campaigns"]
+    except Exception as exc:
+        _api_unavailable(exc)
+        return
+
+    campaign_labels = {
+        c["campaign_id"]: f"Campaign {c['campaign_id']} ({c['description']})"
+        for c in campaigns
+    }
+    with st.form("compare_form"):
+        selected = st.multiselect(
+            "Campaigns to compare",
+            [c["campaign_id"] for c in campaigns],
+            default=[c["campaign_id"] for c in campaigns[:3]],
+            format_func=lambda cid: campaign_labels[cid],
+        )
+        col1, col2 = st.columns(2)
+        objective = col1.selectbox(
+            "Objective",
+            ["profit", "sales", "efficiency"],
+            index=0,
+        )
+        normalization = col2.selectbox(
+            "Normalization", ["min_max", "z_score", "percentile"], index=0
+        )
+        submitted = st.form_submit_button("Compare campaigns", type="primary", width="stretch")
+
+    if not submitted or not selected:
+        return
+
+    try:
+        result = _api_post(
+            "/campaign/compare",
+            {
+                "campaigns": [int(cid) for cid in selected],
+                "objective": objective,
+                "normalization": normalization,
+            },
+        )
+    except Exception as exc:
+        st.error(f"Comparison failed: {exc}")
+        return
+
+    if result.get("message"):
+        st.warning(result["message"])
+        return
+
+    ranking = result["ranking"]
+    rows = pd.DataFrame(
+        [
+            {
+                "campaign_id": row["campaign_id"],
+                "description": row["description"],
+                "score": row["score"],
+                "incremental_profit": row["incremental_profit"],
+                "incremental_sales": row["incremental_sales"],
+                "roi": row["roi"] if row["roi"] is not None else 0.0,
+                "cannibalization_risk": row["cannibalization_risk"],
+                "promotion_cost": row["promotion_cost"],
+            }
+            for row in ranking
+        ]
+    )
+    st.dataframe(rows, width="stretch", hide_index=True)
+    st.bar_chart(rows.set_index("campaign_id")["score"])
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**Strengths**")
+        for item in result["strengths"]:
+            st.markdown(
+                f"- Campaign {item['campaign_id']}: strong on "
+                f"`{item['strength']}` ({item['strength_score']:.2f})"
+            )
+    with col_b:
+        st.markdown("**Weaknesses**")
+        for item in result["weaknesses"]:
+            st.markdown(
+                f"- Campaign {item['campaign_id']}: weak on "
+                f"`{item['weakness']}` ({item['weakness_score']:.2f})"
+            )
+
+
+def recommendation_tab() -> None:
+    """Product recommendation and campaign simulation UI (Phase 5)."""
+    st.subheader("Multi-Objective Recommendation")
+    st.caption(
+        "Evaluate candidate products under a strategy (sales growth, profit "
+        "optimization or safe promotion), optionally capped by a budget."
+    )
+    try:
+        campaigns = _api_get("/campaigns")["campaigns"]
+    except Exception as exc:
+        _api_unavailable(exc)
+        return
+
+    candidate_pool: list[int] = []
+    candidate_labels: dict[int, str] = {}
+    for campaign in campaigns[:8]:
+        detail = _api_get(f"/campaigns/{campaign['campaign_id']}")
+        for product_id in detail["products"][:5]:
+            if product_id not in candidate_labels:
+                candidate_labels[product_id] = f"Product {product_id} (campaign {campaign['campaign_id']})"
+                candidate_pool.append(product_id)
+
+    with st.form("recommend_form"):
+        selected = st.multiselect(
+            "Candidate products",
+            candidate_pool,
+            default=candidate_pool[:3],
+            format_func=lambda pid: candidate_labels.get(pid, f"Product {pid}"),
+        )
+        col1, col2, col3 = st.columns(3)
+        objective = col1.selectbox(
+            "Strategy",
+            ["SALES_GROWTH", "PROFIT_OPTIMIZATION", "SAFE_PROMOTION"],
+            index=1,
+        )
+        budget = col2.number_input("Budget cap ($, 0 = unlimited)", min_value=0.0, value=0.0, step=100.0)
+        max_risk = col3.number_input("Max cannibalization risk (%)", min_value=0.0, value=100.0, step=5.0)
+        submitted = st.form_submit_button("Recommend products", type="primary", width="stretch")
+
+    if submitted and selected:
+        constraints = {"max_cannibalization_risk": float(max_risk)} if max_risk < 100 else None
+        try:
+            result = _api_post(
+                "/campaign/recommend",
+                {
+                    "products": [int(pid) for pid in selected],
+                    "objective": objective,
+                    "budget": float(budget) if budget > 0 else None,
+                    "constraints": constraints,
+                },
+            )
+        except Exception as exc:
+            st.error(f"Recommendation failed: {exc}")
+            return
+        if result.get("message"):
+            st.warning(result["message"])
+            return
+        recs = result["recommendations"]
+        if recs:
+            table = pd.DataFrame(
+                [
+                    {
+                        "product_id": row["product_id"],
+                        "score": row["score"],
+                        "expected_sales": row["expected_sales"],
+                        "expected_profit": row["expected_profit"],
+                        "roi": row["roi"] if row["roi"] is not None else 0.0,
+                        "cannibalization_risk": row["cannibalization_risk"],
+                    }
+                    for row in recs
+                ]
+            )
+            st.dataframe(table, width="stretch", hide_index=True)
+            st.bar_chart(table.set_index("product_id")["score"])
+            st.markdown("**Explanations**")
+            for row in recs:
+                st.markdown(f"- **Product {row['product_id']}** ({row['score']:.0f}/100): {row['explanation']}")
+
+    st.divider()
+    st.markdown("**Campaign simulation**")
+    st.caption(
+        "Simulate a hypothetical discount: baseline demand, expected sales, "
+        "ROI and risks."
+    )
+    with st.form("simulate_form"):
+        col1, col2, col3, col4 = st.columns(4)
+        sim_product = col1.number_input("Product ID", min_value=1, value=1005637, step=1)
+        discount = col2.number_input("Discount (%)", min_value=0.1, max_value=90.0, value=20.0, step=5.0)
+        weeks = col3.number_input("Weeks", min_value=1, max_value=52, value=3, step=1)
+        start_week = col4.number_input("Start week", min_value=1, max_value=102, value=89, step=1)
+        sim_submitted = st.form_submit_button("Simulate campaign", type="primary", width="stretch")
+
+    if sim_submitted:
+        try:
+            simulation = _api_post(
+                "/campaign/simulate",
+                {
+                    "product_id": int(sim_product),
+                    "discount_percentage": float(discount),
+                    "weeks": int(weeks),
+                    "start_week": int(start_week),
+                },
+            )
+        except Exception as exc:
+            st.error(f"Simulation failed: {exc}")
+            return
+        if not simulation.get("available"):
+            st.warning(simulation.get("message", "Simulation not available."))
+            return
+        cols = st.columns(4)
+        cols[0].metric("Baseline sales", f"{simulation['baseline_sales']:,.1f}")
+        cols[1].metric("Expected sales", f"{simulation['expected_sales']:,.1f}")
+        cols[2].metric("Incremental sales", f"{simulation['incremental_sales']:,.1f}")
+        cols[3].metric("ROI", f"{simulation['roi']:.2f}" if simulation["roi"] is not None else "—")
+        st.markdown("**Assumptions**")
+        for assumption in simulation["assumptions"]:
+            st.caption(f"- {assumption}")
+        st.markdown("**Risks**")
+        for risk in simulation["risks"]:
+            st.markdown(f"- {risk}")
+
+
 def main() -> None:
     st.title("Promotion Intelligence Hub")
-    tab_llm, tab_promo, tab_cannibal = st.tabs(
+    tab_llm, tab_promo, tab_cannibal, tab_compare, tab_recommend = st.tabs(
         [
             "💬 Analyst Chat",
             "📊 Promotion Analysis",
             "🔄 Cannibalization",
+            "🏆 Campaign Compare",
+            "🎯 Recommend & Simulate",
         ]
     )
     with tab_llm:
@@ -498,6 +715,10 @@ def main() -> None:
         promotion_tab()
     with tab_cannibal:
         cannibalization_tab()
+    with tab_compare:
+        campaign_compare_tab()
+    with tab_recommend:
+        recommendation_tab()
 
 
 if __name__ == "__main__":

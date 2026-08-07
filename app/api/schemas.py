@@ -79,3 +79,50 @@ class ExplainRequest(BaseModel):
     campaign_id: int | None = Field(default=None, ge=1, le=10_000)
     product_id: int | None = Field(default=None, ge=1)
     question: str | None = Field(default=None, min_length=1, max_length=4_000)
+
+
+class DateRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start_week: int | None = Field(default=None, ge=1, le=102)
+    end_week: int | None = Field(default=None, ge=1, le=102)
+
+
+class PromotionAnalyzeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(ge=1)
+    promotion_id: int | None = Field(default=None, ge=1, le=10_000)
+    store_id: int | None = Field(default=None, ge=1)
+    date_range: DateRange | None = None
+
+
+class CampaignCompareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    campaigns: list[int] = Field(min_length=1, max_length=100)
+    objective: str = Field(default="profit", min_length=1, max_length=50)
+    weights: dict[str, float] | None = None
+    normalization: Literal["min_max", "z_score", "percentile"] = "min_max"
+
+
+class CampaignRecommendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    products: list[int] = Field(min_length=1, max_length=200)
+    budget: float | None = Field(default=None, ge=0)
+    objective: str | None = Field(default=None, min_length=1, max_length=50)
+    constraints: dict[str, Any] | None = None
+    date_range: DateRange | None = None
+
+
+class CampaignSimulateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(ge=1)
+    discount_percentage: float = Field(gt=0, le=90)
+    weeks: int = Field(ge=1, le=52)
+    start_week: int | None = Field(default=None, ge=1, le=102)
+    elasticity: float | None = Field(default=None, ge=0)
+
+
+class PromotionReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(ge=1)
+    promotion_id: int | None = Field(default=None, ge=1, le=10_000)
+    date_range: DateRange | None = None

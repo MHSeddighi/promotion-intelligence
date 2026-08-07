@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.deps import init_state, shutdown_state
-from app.api.routers import analytics, assistant, campaigns, system
+from app.api.routers import analytics, assistant, campaigns, promotion, system
 
 
 @asynccontextmanager
@@ -30,4 +30,5 @@ app = FastAPI(
 app.include_router(system.router)
 app.include_router(campaigns.router)
 app.include_router(analytics.router)
+app.include_router(promotion.router)
 app.include_router(assistant.router)
